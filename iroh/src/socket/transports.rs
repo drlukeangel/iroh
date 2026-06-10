@@ -4,9 +4,53 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
     num::NonZeroUsize,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
 };
+
+// ---------------------------------------------------------------------------
+// Flow-stage diagnostic counters (stage i + ii).
+// Emitted every 5s by spawn_flow_gauge_reporter() via eprintln! (bypasses
+// all tracing-subscriber filters and RUST_LOG).
+// Stage i:       how many times noq's driver called Sender::poll_send.
+// Stage ii-ok:   try_send reached inbox and succeeded.
+// Stage ii-drop: try_send reached inbox, inbox full — packet dropped.
+// Stage iii:     RemoteStateActor drain-loop ticks (defined in remote_state.rs).
+// ---------------------------------------------------------------------------
+pub(crate) static FLOW_POLL_SEND_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FLOW_TRY_SEND_OK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FLOW_TRY_SEND_DROP: AtomicU64 = AtomicU64::new(0);
+
+/// Spawns a tokio task that prints flow-stage counters to stderr every 5
+/// seconds, bypassing all tracing-subscriber filters.  Call once at endpoint
+/// creation.  The task runs until the runtime shuts down.
+///
+/// Output format (one line per tick):
+/// `[flow-gauge] poll_send_calls=N try_send_ok=N try_send_drop=N actor_drain_ticks=N`
+///
+/// Interpretation:
+/// - `poll_send_calls` flatlines → noq driver never asks to send (block upstream).
+/// - `try_send_ok/drop` advance but `actor_drain_ticks` flatlines → actor blocked inside handle_message.
+/// - `try_send_drop` > 0 → inbox saturation (capacity story).
+pub(crate) fn spawn_flow_gauge_reporter() {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let calls  = FLOW_POLL_SEND_CALLS.load(Ordering::Relaxed);
+            let ok     = FLOW_TRY_SEND_OK.load(Ordering::Relaxed);
+            let drop   = FLOW_TRY_SEND_DROP.load(Ordering::Relaxed);
+            let drains = crate::socket::remote_map::FLOW_ACTOR_DRAIN_TICKS
+                .load(Ordering::Relaxed);
+            eprintln!(
+                "[flow-gauge] poll_send_calls={calls} try_send_ok={ok} try_send_drop={drop} actor_drain_ticks={drains}"
+            );
+        }
+    });
+}
 
 use bytes::Bytes;
 use iroh_base::{CustomAddr, EndpointId, RelayUrl, TransportAddr};
@@ -242,6 +286,11 @@ impl Transports {
             let transport = config.bind()?;
             custom.push(transport);
         }
+
+        // Kick off the diagnostic gauge reporter.  Runs for the lifetime of
+        // the runtime; harmless if multiple endpoints exist (counters are
+        // process-global — the reporter just prints them wherever it runs).
+        spawn_flow_gauge_reporter();
 
         Ok(Self {
             #[cfg(not(wasm_browser))]
@@ -1212,6 +1261,9 @@ impl noq::UdpSender for Sender {
         noq_transmit: &noq_udp::Transmit,
         cx: &mut Context,
     ) -> Poll<io::Result<()>> {
+        // Stage i: count every invocation so we know if noq's driver is asking to send.
+        FLOW_POLL_SEND_CALLS.fetch_add(1, Ordering::Relaxed);
+
         // On errors this methods prefers returning Ok(()) to Noq.  Returning an error
         // should only happen if the error is permanent and fatal and it will never be
         // possible to send anything again.  Doing so kills the Noq EndpointDriver.  Most
@@ -1244,10 +1296,14 @@ impl noq::UdpSender for Sender {
                     ),
                 ) {
                     Ok(()) => {
+                        // Stage ii-ok: try_send reached the inbox and succeeded.
+                        FLOW_TRY_SEND_OK.fetch_add(1, Ordering::Relaxed);
                         trace!(dst = ?mapped_addr, dst_endpoint = %endpoint_id.fmt_short(), "sent transmit");
                         return Poll::Ready(Ok(()));
                     }
                     Err(_msg) => {
+                        // Stage ii-drop: inbox full — packet silently discarded.
+                        FLOW_TRY_SEND_DROP.fetch_add(1, Ordering::Relaxed);
                         // We do not want to block the next send which might be on a
                         // different transport.  Instead we let Noq handle this as
                         // a lost datagram.

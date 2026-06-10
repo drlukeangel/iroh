@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeSet, VecDeque},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::Poll,
 };
 
@@ -43,6 +46,12 @@ use crate::{
 mod path_state;
 mod path_watcher;
 mod remote_info;
+
+// Stage iii diagnostic counter: incremented each time the RemoteStateActor
+// drains one message from its inbox.  If this flatlines while stage-i/ii
+// advance, the actor is stalled inside an async call (e.g. handle_message).
+// Emitted by spawn_flow_gauge_reporter() in transports.rs every 5s.
+pub(crate) static FLOW_ACTOR_DRAIN_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// How often to attempt holepunching.
 ///
@@ -286,7 +295,11 @@ impl RemoteStateActor {
                 }
                 msg = inbox.recv() => {
                     match msg {
-                        Some(msg) => self.handle_message(msg).await,
+                        Some(msg) => {
+                            // Stage iii: actor is draining — count every message consumed.
+                            FLOW_ACTOR_DRAIN_TICKS.fetch_add(1, Ordering::Relaxed);
+                            self.handle_message(msg).await;
+                        }
                         None => break,
                     }
                 }
