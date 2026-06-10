@@ -123,4 +123,10 @@ pub struct Metrics {
     pub actor_link_change: Counter,
     /// Number of times an input watcher or receiver closed in the socket actor loop.
     pub actor_tick_other: Counter,
+
+    /// Number of QUIC Initial / handshake datagrams dropped because the
+    /// RemoteStateActor inbox was full.  Each increment means a QUIC packet
+    /// was silently discarded; sustained non-zero values during connection
+    /// setup indicate inbox saturation and can cause handshake timeouts.
+    pub remote_actor_datagram_dropped: Counter,
 }
