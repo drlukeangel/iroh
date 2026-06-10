@@ -400,6 +400,8 @@ impl RemoteStateActor {
                 self.handle_msg_network_change(is_major);
             }
         }
+
+        eprintln!("[flow-bracket] handle_message EXIT variant={variant}");
     }
 
     /// Handles [`RemoteStateMessage::AddConnection`].
@@ -831,8 +833,10 @@ impl State {
             // See https://github.com/n0-computer/iroh/issues/4280.
             smallvec![transports::FourTuple::from_remote(addr.remote())]
         } else {
+            let all_paths: Vec<_> = self.paths.addrs().collect();
+            eprintln!("[flow-bracket] send_datagram all_paths paths={all_paths:?}");
             trace!(
-                paths = ?self.paths.addrs().collect::<Vec<_>>(),
+                paths = ?all_paths,
                 "sending datagram to all known paths",
             );
             if self.paths.is_empty() {
@@ -859,6 +863,7 @@ impl State {
                     targets.push(transports::FourTuple::from_remote(addr.clone()));
                 }
             }
+            eprintln!("[flow-bracket] send_datagram loop_done");
             // This message is received *before* a connection is added.  So we do
             // not yet have a connection to holepunch.  Instead we trigger
             // holepunching when AddConnection is received.
