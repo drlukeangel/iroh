@@ -375,10 +375,21 @@ impl RemoteStateActor {
     /// Error returns are fatal and kill the actor.
     #[instrument(skip(self))]
     async fn handle_message(&mut self, msg: RemoteStateMessage) {
-        // trace!("handling message");
+        // [flow-bracket] entry — eprintln bypasses all tracing filters.
+        let variant = match &msg {
+            RemoteStateMessage::SendDatagram(_, _) => "SendDatagram",
+            RemoteStateMessage::AddConnection(_, _) => "AddConnection",
+            RemoteStateMessage::ResolveRemote(_, _) => "ResolveRemote",
+            RemoteStateMessage::RemoteInfo(_) => "RemoteInfo",
+            RemoteStateMessage::NetworkChange { .. } => "NetworkChange",
+        };
+        eprintln!("[flow-bracket] handle_message ENTER variant={variant}");
+
         match msg {
             RemoteStateMessage::SendDatagram(sender, transmit) => {
+                eprintln!("[flow-bracket] handle_message PRE_AWAIT variant=SendDatagram");
                 self.state.handle_msg_send_datagram(sender, transmit).await;
+                eprintln!("[flow-bracket] handle_message POST_AWAIT variant=SendDatagram");
             }
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
@@ -398,6 +409,8 @@ impl RemoteStateActor {
                 self.handle_msg_network_change(is_major);
             }
         }
+
+        eprintln!("[flow-bracket] handle_message EXIT variant={variant}");
     }
 
     /// Handles [`RemoteStateMessage::AddConnection`].
@@ -824,12 +837,17 @@ impl State {
             // know that it is the correct one.
             // See https://github.com/n0-computer/iroh/issues/4280.
             let four_tuple = transports::FourTuple::from_remote(addr.remote());
-            if let Err(err) = send_datagram(&mut sender, four_tuple, transmit).await {
+            eprintln!("[flow-bracket] send_datagram PRE selected_path addr={addr:?}");
+            let result = send_datagram(&mut sender, four_tuple, transmit).await;
+            eprintln!("[flow-bracket] send_datagram POST selected_path addr={addr:?} ok={}", result.is_ok());
+            if let Err(err) = result {
                 debug!(?addr, "failed to send datagram on selected_path: {err:#}");
             }
         } else {
+            let all_paths: Vec<_> = self.paths.addrs().collect();
+            eprintln!("[flow-bracket] send_datagram all_paths paths={all_paths:?}");
             trace!(
-                paths = ?self.paths.addrs().collect::<Vec<_>>(),
+                paths = ?all_paths,
                 "sending datagram to all known paths",
             );
             if self.paths.is_empty() {
@@ -851,16 +869,21 @@ impl State {
                 // TODO(Frando): We might want to include a local IP here in the future, if we confidently
                 // know that it is the correct one.
                 // See https://github.com/n0-computer/iroh/issues/4280.
-                } else if let Err(err) = send_datagram(
-                    &mut sender,
-                    transports::FourTuple::from_remote(addr.clone()),
-                    transmit.clone(),
-                )
-                .await
-                {
-                    debug!(?addr, "failed to send datagram: {err:#}");
+                } else {
+                    eprintln!("[flow-bracket] send_datagram PRE loop addr={addr:?}");
+                    let result = send_datagram(
+                        &mut sender,
+                        transports::FourTuple::from_remote(addr.clone()),
+                        transmit.clone(),
+                    )
+                    .await;
+                    eprintln!("[flow-bracket] send_datagram POST loop addr={addr:?} ok={}", result.is_ok());
+                    if let Err(err) = result {
+                        debug!(?addr, "failed to send datagram: {err:#}");
+                    }
                 }
             }
+            eprintln!("[flow-bracket] send_datagram loop_done");
             // This message is received *before* a connection is added.  So we do
             // not yet have a connection to holepunch.  Instead we trigger
             // holepunching when AddConnection is received.
