@@ -86,4 +86,10 @@ pub struct Metrics {
     pub actor_tick_direct_addr_heartbeat: Counter,
     pub actor_link_change: Counter,
     pub actor_tick_other: Counter,
+
+    /// Number of QUIC Initial / handshake datagrams dropped because the
+    /// RemoteStateActor inbox was full.  Each increment means a QUIC packet
+    /// was silently discarded; sustained non-zero values during connection
+    /// setup indicate inbox saturation and can cause handshake timeouts.
+    pub remote_actor_datagram_dropped: Counter,
 }

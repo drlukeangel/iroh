@@ -14,7 +14,7 @@ use iroh_relay::RelayMap;
 use n0_watcher::Watcher;
 use relay::{RelayNetworkChangeSender, RelaySender};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{error, instrument, trace, warn};
 
 use super::{Socket, mapped_addrs::MultipathMappedAddr};
 use crate::{
@@ -1247,16 +1247,26 @@ impl noq::UdpSender for Sender {
                         trace!(dst = ?mapped_addr, dst_endpoint = %endpoint_id.fmt_short(), "sent transmit");
                         return Poll::Ready(Ok(()));
                     }
-                    Err(msg) => {
+                    Err(_msg) => {
                         // We do not want to block the next send which might be on a
                         // different transport.  Instead we let Noq handle this as
                         // a lost datagram.
-                        // TODO: Revisit this: we might want to do something better.
-                        debug!(
+                        //
+                        // IMPORTANT: Sustained drops here mean the RemoteStateActor
+                        // inbox is full.  Each drop silently discards a QUIC Initial
+                        // or retransmit packet; if the inbox stays full across all of
+                        // noq's retransmit attempts (up to 30s), the handshake times
+                        // out with "timed out" and the runtime appears frozen.
+                        // Watch `remote_actor_datagram_dropped` in metrics to detect.
+                        self.sock
+                            .metrics
+                            .socket
+                            .remote_actor_datagram_dropped
+                            .inc();
+                        warn!(
                             dst = ?mapped_addr,
                             dst_endpoint = %endpoint_id.fmt_short(),
-                            ?msg,
-                            "RemoteStateActor inbox dropped message"
+                            "RemoteStateActor inbox full: QUIC datagram dropped (handshake may stall)"
                         );
                         return Poll::Ready(Ok(()));
                     }

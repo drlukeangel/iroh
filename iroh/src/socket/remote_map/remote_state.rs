@@ -212,7 +212,15 @@ impl RemoteStateActor {
         shutdown_token: CancellationToken,
         parent_span: Span,
     ) -> mpsc::Sender<RemoteStateMessage> {
-        let (tx, rx) = mpsc::channel(16);
+        // Capacity 64: accommodates connection-burst scenarios where gossip +
+        // multiple concurrent QUIC handshakes each dispatch SendDatagram messages
+        // simultaneously.  At capacity-16 the inlet overflows during 2-node
+        // boot (two concurrent connects + gossip), causing try_send to drop
+        // QUIC Initial/retransmit packets and stalling handshakes for 30s.
+        // Cap 64 fits: ~3 concurrent connects × ~10 Initial/retry packets +
+        // ~20 gossip datagrams = up to ~50 in a burst.  Sized conservatively
+        // with room; not unbounded to preserve backpressure on control messages.
+        let (tx, rx) = mpsc::channel(64);
         let endpoint_id = self.state.endpoint_id;
 
         // Ideally we'd use the endpoint span as parent.  We'd have to plug that span into
