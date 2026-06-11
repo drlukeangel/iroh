@@ -19,6 +19,10 @@ use std::{
 // Stage ii-ok:   try_send reached inbox and succeeded.
 // Stage ii-drop: try_send reached inbox, inbox full — packet dropped.
 // Stage iii:     RemoteStateActor drain-loop ticks (defined in remote_state.rs).
+// run_loop_iters: actor's select-loop iterations (spins here if non-inbox arm fires hot).
+// heartbeat:     free-running counter in the reporter task itself; if this advances
+//                but other counters flatline, the reporter is alive and the actor task
+//                is genuinely not being polled (waker lost or runtime starvation).
 // ---------------------------------------------------------------------------
 pub(crate) static FLOW_POLL_SEND_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FLOW_TRY_SEND_OK: AtomicU64 = AtomicU64::new(0);
@@ -29,24 +33,34 @@ pub(crate) static FLOW_TRY_SEND_DROP: AtomicU64 = AtomicU64::new(0);
 /// creation.  The task runs until the runtime shuts down.
 ///
 /// Output format (one line per tick):
-/// `[flow-gauge] poll_send_calls=N try_send_ok=N try_send_drop=N actor_drain_ticks=N`
+/// ```text
+/// [flow-gauge] hb=N poll_send=N try_ok=N try_drop=N drain=N loop_iters=N
+/// ```
 ///
 /// Interpretation:
-/// - `poll_send_calls` flatlines → noq driver never asks to send (block upstream).
-/// - `try_send_ok/drop` advance but `actor_drain_ticks` flatlines → actor blocked inside handle_message.
-/// - `try_send_drop` > 0 → inbox saturation (capacity story).
+/// - `hb` advances but all others flatline → reporter alive; actor task not polled (waker lost or
+///   runtime fully starved by another spinning task).
+/// - `hb` flatlines → reporter itself is starved (runtime blocked; single spinning task).
+/// - `loop_iters` advances without `drain` advancing → actor IS running but a non-inbox
+///   select arm fires repeatedly (hot spin; see [flow-bracket] SELECT_ARM lines to identify which).
+/// - `drain` advances → actor is consuming messages (not stuck between messages).
+/// - `try_drop` > 0 → inbox saturation (capacity story).
 pub(crate) fn spawn_flow_gauge_reporter() {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut heartbeat: u64 = 0;
         loop {
             interval.tick().await;
-            let calls  = FLOW_POLL_SEND_CALLS.load(Ordering::Relaxed);
-            let ok     = FLOW_TRY_SEND_OK.load(Ordering::Relaxed);
-            let drop   = FLOW_TRY_SEND_DROP.load(Ordering::Relaxed);
-            let drains = crate::socket::remote_map::FLOW_ACTOR_DRAIN_TICKS
+            heartbeat += 1;
+            let calls      = FLOW_POLL_SEND_CALLS.load(Ordering::Relaxed);
+            let ok         = FLOW_TRY_SEND_OK.load(Ordering::Relaxed);
+            let drop       = FLOW_TRY_SEND_DROP.load(Ordering::Relaxed);
+            let drains     = crate::socket::remote_map::FLOW_ACTOR_DRAIN_TICKS
+                .load(Ordering::Relaxed);
+            let loop_iters = crate::socket::remote_map::FLOW_RUN_LOOP_ITERS
                 .load(Ordering::Relaxed);
             eprintln!(
-                "[flow-gauge] poll_send_calls={calls} try_send_ok={ok} try_send_drop={drop} actor_drain_ticks={drains}"
+                "[flow-gauge] hb={heartbeat} poll_send={calls} try_ok={ok} try_drop={drop} drain={drains} loop_iters={loop_iters}"
             );
         }
     });
