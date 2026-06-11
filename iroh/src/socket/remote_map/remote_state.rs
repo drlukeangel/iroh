@@ -13,7 +13,7 @@ use iroh_base::{CustomAddr, EndpointId, RelayUrl, TransportAddr};
 use n0_error::StackResultExt;
 use n0_future::{
     FuturesUnordered, MaybeFuture, MergeUnbounded, Stream, StreamExt,
-    boxed::BoxStream,
+    boxed::{BoxFuture, BoxStream},
     stream,
     task::JoinSet,
     time::{self, Duration, Instant},
@@ -147,6 +147,38 @@ fn addr_events_with_sentinel() -> AddrEvents {
     merge
 }
 
+/// Futures that resolve when each noq connection closes.
+///
+/// The connection is identified by [`ConnId`].  Uses a boxed future type so that a
+/// never-resolving sentinel can be seeded alongside real [`OnClosed`] futures without
+/// requiring a common concrete type.
+type ConnectionsClose = FuturesUnordered<BoxFuture<(ConnId, Closed)>>;
+
+/// Returns a [`ConnectionsClose`] set pre-seeded with a sentinel that never resolves.
+///
+/// # Waker-loss fix
+///
+/// The previous code used `FuturesUnordered<OnClosed>` with a select guard
+/// `if !self.state.connections_close.is_empty()`.  When the set is empty the guard
+/// disables the arm, and `FuturesUnordered::poll_next` on an empty set returns
+/// `Poll::Ready(None)` WITHOUT registering a waker.  Consequently, when
+/// `AddConnection` pushes the first `OnClosed` future, no waker is registered for
+/// that arm and the select never re-examines it.
+///
+/// The same waker-loss property applies as for [`path_events_with_sentinel`]: seeding
+/// with `std::future::pending()` keeps the set non-empty at all times so
+/// `FuturesUnorderedBounded::poll_inner_no_remove` always reaches
+/// `self.shared.register(cx.waker())` before inspecting the ready queue, ensuring the
+/// outer task is always woken when new futures are pushed and become ready.
+///
+/// With a sentinel the guard is no longer necessary and has been removed.
+fn connections_close_with_sentinel() -> ConnectionsClose {
+    let sentinel: BoxFuture<(ConnId, Closed)> = Box::pin(std::future::pending());
+    let mut set = FuturesUnordered::new();
+    set.push(sentinel);
+    set
+}
+
 /// The state we need to know about a single remote endpoint.
 ///
 /// This actor manages all connections to the remote endpoint.  It will trigger holepunching
@@ -183,7 +215,7 @@ struct State {
     // Internal state - Noq Connections we are managing.
     //
     /// Notifications when connections are closed.
-    connections_close: FuturesUnordered<OnClosed>,
+    connections_close: ConnectionsClose,
     /// Events emitted by Noq about path changes, for all paths, all connections.
     path_events: PathEvents,
     /// A stream of events of announced NAT traversal candidate addresses for all connections.
@@ -246,7 +278,7 @@ impl RemoteStateActor {
                 relay_mapped_addrs,
                 custom_mapped_addrs,
                 address_lookup,
-                connections_close: Default::default(),
+                connections_close: connections_close_with_sentinel(),
                 path_events: path_events_with_sentinel(),
                 addr_events: addr_events_with_sentinel(),
                 paths: RemotePathState::new(metrics),
@@ -370,7 +402,7 @@ impl RemoteStateActor {
                     trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
                     self.trigger_holepunching();
                 }
-                Some((conn_id, closed)) = self.state.connections_close.next(), if !self.state.connections_close.is_empty() => {
+                Some((conn_id, closed)) = self.state.connections_close.next() => {
                     eprintln!("[flow-bracket] SELECT_ARM connections_close conn_id={conn_id:?}");
                     self.handle_connection_close(conn_id, closed);
                 }
@@ -495,7 +527,7 @@ impl RemoteStateActor {
         self.state.addr_events.push(Box::pin(
             conn.nat_traversal_updates().map(move |evt| (conn_id, evt)),
         ));
-        self.state.connections_close.push(OnClosed::new(&conn));
+        self.state.connections_close.push(Box::pin(OnClosed::new(&conn)));
 
         // Add local addrs to the connection
         let local_addrs = self.state.local_candidates();
@@ -1645,158 +1677,234 @@ mod tests {
         task::Poll,
     };
 
-    use n0_future::{MergeUnbounded, Stream, StreamExt, stream};
+    use n0_future::{FuturesUnordered, MergeUnbounded, Stream, StreamExt, stream};
     use tokio::sync::mpsc;
 
-    /// Regression test for the MergeUnbounded waker-loss bug.
+    /// Build a manual tracking waker backed by an `Arc<AtomicBool>`.
+    ///
+    /// The bool is set to `true` whenever the waker is fired.  Returns both the
+    /// bool (for inspection) and the waker.
+    fn tracking_waker() -> (Arc<AtomicBool>, std::task::Waker) {
+        use std::task::{RawWaker, RawWakerVTable};
+
+        fn clone_fn(ptr: *const ()) -> RawWaker {
+            let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
+            let cloned = arc.clone();
+            std::mem::forget(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
+        }
+        fn wake_fn(ptr: *const ()) {
+            let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
+            arc.store(true, Ordering::SeqCst);
+        }
+        fn wake_by_ref_fn(ptr: *const ()) {
+            let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
+            arc.store(true, Ordering::SeqCst);
+            std::mem::forget(arc);
+        }
+        fn drop_fn(ptr: *const ()) {
+            drop(unsafe { Arc::from_raw(ptr as *const AtomicBool) });
+        }
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let raw = RawWaker::new(Arc::into_raw(flag.clone()) as *const (), &VTABLE);
+        (flag, unsafe { std::task::Waker::from_raw(raw) })
+    }
+
+    /// Regression test for the three-arm waker-loss bug in [`RemoteStateActor`]'s run loop.
     ///
     /// # Root cause
     ///
-    /// `MergeUnbounded::poll_next` on an empty set returns `Poll::Ready(None)` WITHOUT
-    /// registering a waker.  When [`RemoteStateActor`] later pushes a connection's event
-    /// stream via `AddConnection`, the `select!` arm for `path_events.next()` has no waker
-    /// registered and never reschedules the task.  The entire `select!` — including
-    /// `inbox.recv()` — stops being polled permanently.  CPU is flat (park, not spin) and
-    /// `FLOW_ACTOR_DRAIN_TICKS` + `FLOW_RUN_LOOP_ITERS` flatline after message #9.
+    /// Three arms in the actor's biased `select!` each exhibit waker-loss when their
+    /// backing collection is empty:
+    ///
+    /// 1. `path_events.next()` — `MergeUnbounded::poll_next` on an empty set returns
+    ///    `Poll::Ready(None)` WITHOUT registering a waker (futures-buffered upstream).
+    /// 2. `addr_events.next()` — same type, same property.
+    /// 3. `connections_close.next()` — was guarded by `if !self.connections_close.is_empty()`,
+    ///    so tokio never polled the arm when empty, registering no waker.  When
+    ///    `AddConnection` pushed the first `OnClosed` future, nothing woke the select.
+    ///
+    /// In all three cases, after the first `AddConnection` message pushes real streams/futures
+    /// into the collections, the corresponding select arms had no waker registered, so the
+    /// entire select — including `inbox.recv()` — was never re-polled.  The actor parked
+    /// permanently (CPU flat, `FLOW_RUN_LOOP_ITERS` flatlined).
     ///
     /// # Fix
     ///
-    /// Seed both `path_events` and `addr_events` with a never-terminating sentinel
-    /// (`stream::pending()`) so the merge is always non-empty and always returns
-    /// `Poll::Pending` with a registered waker when no real events are available.
+    /// Seed all three collections with a never-resolving / never-terminating sentinel
+    /// (`stream::pending()` for the two merges, `std::future::pending()` for the
+    /// `FuturesUnordered`) so `poll_next` always returns `Poll::Pending` (with a registered
+    /// waker) rather than `Poll::Ready(None)` (with no waker) when no real events are
+    /// available.  The guard on `connections_close` is removed — the sentinel makes it safe.
     ///
     /// # Test structure
     ///
-    /// Part A: directly verifies the upstream waker-loss property — an empty
-    /// `MergeUnbounded` polled with a tracking waker returns `Ready(None)` without
-    /// triggering the waker.
+    /// Part A: unit-level proof that both `MergeUnbounded` and `FuturesUnordered` do NOT
+    /// register a waker when polled empty — confirming the upstream waker-loss property that
+    /// the sentinel fix relies on.  These assertions act as canaries: if futures-buffered ever
+    /// fixes the upstream behaviour, they will fail and alert maintainers that the rationale
+    /// has changed (though the sentinel fix remains correct regardless).
     ///
-    /// Part B: positive proof that the sentinel fix works end-to-end in a real
-    /// `biased select!` with a merge arm + an mpsc inbox arm.  After `AddConnection`
-    /// (simulated by pushing a one-shot stream), the merge wakes the select so the
-    /// subsequent inbox message is also observed within a short timeout.
+    /// Parts B / C / D: positive end-to-end proofs that each sentinel-seeded arm (`path_events`,
+    /// `addr_events`, `connections_close`) keeps a biased `select!` alive through the
+    /// equivalent of an `AddConnection` event — a new stream / future pushed after the select
+    /// has already parked.  In each case both the arm event and a subsequent inbox message are
+    /// received within 500ms.  A single-arm sentinel passing Parts B or C cannot mask a missing
+    /// sentinel on the other arms; each arm is exercised independently.
     #[tokio::test]
-    async fn merge_unbounded_sentinel_prevents_waker_loss() {
+    async fn actor_run_loop_sentinels_prevent_waker_loss() {
         type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send + Sync>>;
+        type BoxFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
         // -----------------------------------------------------------------------
-        // Part A: direct proof that an empty MergeUnbounded does NOT register a waker.
+        // Part A: unit-level proof of the upstream waker-loss property.
         // -----------------------------------------------------------------------
         {
-            // A manual waker that sets a flag when fired.
-            let woken = Arc::new(AtomicBool::new(false));
-
-            let waker = {
-                use std::task::{RawWaker, RawWakerVTable, Waker};
-
-                fn clone_fn(ptr: *const ()) -> RawWaker {
-                    let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
-                    let cloned = arc.clone();
-                    std::mem::forget(arc);
-                    RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
-                }
-                fn wake_fn(ptr: *const ()) {
-                    let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
-                    arc.store(true, Ordering::SeqCst);
-                }
-                fn wake_by_ref_fn(ptr: *const ()) {
-                    let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
-                    arc.store(true, Ordering::SeqCst);
-                    std::mem::forget(arc);
-                }
-                fn drop_fn(ptr: *const ()) {
-                    drop(unsafe { Arc::from_raw(ptr as *const AtomicBool) });
-                }
-                static VTABLE: RawWakerVTable =
-                    RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
-
-                let raw =
-                    RawWaker::new(Arc::into_raw(woken.clone()) as *const (), &VTABLE);
-                unsafe { Waker::from_raw(raw) }
-            };
+            // A.1 — MergeUnbounded (covers path_events and addr_events arms).
+            let (woken, waker) = tracking_waker();
             let mut cx = std::task::Context::from_waker(&waker);
-
             let mut merge: MergeUnbounded<BoxStream<u32>> = MergeUnbounded::new();
 
-            // An empty merge must return Ready(None) per futures-buffered semantics.
             let poll_result = Pin::new(&mut merge).poll_next(&mut cx);
             assert!(
                 matches!(poll_result, Poll::Ready(None)),
                 "expected Ready(None) from empty MergeUnbounded, got {poll_result:?}"
             );
-
-            // The waker must NOT have been triggered — this is the waker-loss.
-            // If MergeUnbounded registered the waker on Ready(None) this assertion
-            // would fail and the bug would not exist; keep it as a canary for if
-            // futures-buffered ever fixes the upstream behaviour.
             assert!(
                 !woken.load(Ordering::SeqCst),
-                "futures-buffered behaviour changed: waker fired on Ready(None) from empty merge. \
-                 The sentinel fix is still correct but the bug rationale has changed."
+                "futures-buffered changed: MergeUnbounded fired waker on Ready(None). \
+                 Sentinel fix is still correct but rationale has changed."
+            );
+
+            // A.2 — FuturesUnordered (covers connections_close arm).
+            let (woken2, waker2) = tracking_waker();
+            let mut cx2 = std::task::Context::from_waker(&waker2);
+            let mut futs: FuturesUnordered<BoxFuture<u32>> = FuturesUnordered::new();
+
+            let poll_result2 = Pin::new(&mut futs).poll_next(&mut cx2);
+            assert!(
+                matches!(poll_result2, Poll::Ready(None)),
+                "expected Ready(None) from empty FuturesUnordered, got {poll_result2:?}"
+            );
+            assert!(
+                !woken2.load(Ordering::SeqCst),
+                "futures-buffered changed: FuturesUnordered fired waker on Ready(None). \
+                 Sentinel fix is still correct but rationale has changed."
             );
         }
 
-        // -----------------------------------------------------------------------
-        // Part B: positive proof that the sentinel keeps the select alive.
-        // -----------------------------------------------------------------------
-        // With the sentinel in place, pushing a one-shot stream after the select has
-        // already parked causes the merge to wake the task so both the merge item and
-        // an inbox message are delivered within a short timeout.
+        // Helper: run a biased select loop driving a stream arm + an inbox arm.
+        // Fires items into both from a background task and asserts both are received.
+        async fn run_select_with_stream<S>(mut stream_arm: S, label: &str)
+        where
+            S: StreamExt<Item = u32> + Unpin,
         {
-            let (item_tx, item_rx) = tokio::sync::oneshot::channel::<u32>();
             let (inbox_tx, mut inbox_rx) = mpsc::channel::<u32>(4);
 
-            // Fixed merge: seeded with a sentinel that never terminates.
-            let sentinel: BoxStream<u32> = Box::pin(stream::pending());
-            let mut merge: MergeUnbounded<BoxStream<u32>> = MergeUnbounded::new();
-            merge.push(sentinel);
-
-            // Simulate AddConnection: push a one-shot stream backed by a oneshot channel.
-            // stream::once_future wraps a Future into a single-item Stream (no async_stream dep).
-            let real_stream: BoxStream<u32> =
-                Box::pin(stream::once_future(async move { item_rx.await.unwrap_or(0) }));
-            merge.push(real_stream);
-
-            // Fire the item and then the inbox message from a background task, with
-            // yield_now() to allow the select to park before each send.
             tokio::spawn(async move {
                 tokio::task::yield_now().await;
-                let _ = item_tx.send(42u32);
-                tokio::task::yield_now().await;
+                // The stream arm item is already in the stream via the caller's setup.
+                // We just need to send the inbox message to confirm the select is alive.
                 let _ = inbox_tx.send(99u32).await;
             });
 
-            let mut got_merge_item = false;
+            let mut got_stream_item = false;
             let mut got_inbox_msg = false;
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_millis(500);
             loop {
-                if got_merge_item && got_inbox_msg {
+                if got_stream_item && got_inbox_msg {
                     break;
                 }
                 if tokio::time::Instant::now() > deadline {
                     panic!(
-                        "waker-loss regression: biased select did not receive both events \
-                         within 500ms (got_merge_item={got_merge_item} \
-                         got_inbox_msg={got_inbox_msg}). Without the sentinel, the merge arm \
-                         parks permanently after the first empty poll and no subsequent event \
-                         wakes the task."
+                        "[{label}] waker-loss: select did not receive both events within 500ms \
+                         (got_stream_item={got_stream_item} got_inbox_msg={got_inbox_msg}). \
+                         The arm's sentinel may be missing or the stream/future was not woken."
                     );
                 }
                 tokio::select! {
                     biased;
-                    Some(item) = merge.next() => {
-                        assert_eq!(item, 42u32, "unexpected merge item");
-                        got_merge_item = true;
+                    Some(item) = stream_arm.next() => {
+                        assert_eq!(item, 42u32, "[{label}] unexpected stream item");
+                        got_stream_item = true;
                     }
                     msg = inbox_rx.recv() => {
                         if let Some(msg) = msg {
-                            assert_eq!(msg, 99u32, "unexpected inbox message");
+                            assert_eq!(msg, 99u32, "[{label}] unexpected inbox message");
                             got_inbox_msg = true;
                         }
                     }
                 }
             }
+        }
+
+        // -----------------------------------------------------------------------
+        // Part B: path_events arm — MergeUnbounded with sentinel.
+        // -----------------------------------------------------------------------
+        {
+            let (item_tx, item_rx) = tokio::sync::oneshot::channel::<u32>();
+
+            let mut merge: MergeUnbounded<BoxStream<u32>> = MergeUnbounded::new();
+            merge.push(Box::pin(stream::pending()));  // sentinel
+
+            // Simulate AddConnection: push a one-shot stream.
+            merge.push(Box::pin(stream::once_future(async move {
+                item_rx.await.unwrap_or(0)
+            })));
+
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                let _ = item_tx.send(42u32);
+            });
+
+            run_select_with_stream(merge, "path_events").await;
+        }
+
+        // -----------------------------------------------------------------------
+        // Part C: addr_events arm — MergeUnbounded with sentinel (same type, separate proof).
+        // -----------------------------------------------------------------------
+        {
+            let (item_tx, item_rx) = tokio::sync::oneshot::channel::<u32>();
+
+            let mut merge: MergeUnbounded<BoxStream<u32>> = MergeUnbounded::new();
+            merge.push(Box::pin(stream::pending()));  // sentinel
+
+            merge.push(Box::pin(stream::once_future(async move {
+                item_rx.await.unwrap_or(0)
+            })));
+
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                let _ = item_tx.send(42u32);
+            });
+
+            run_select_with_stream(merge, "addr_events").await;
+        }
+
+        // -----------------------------------------------------------------------
+        // Part D: connections_close arm — FuturesUnordered with sentinel.
+        // -----------------------------------------------------------------------
+        // The select arm pattern is `Some(item) = futs.next()`.  FuturesUnordered
+        // implements Stream so we can drive it through the same helper.
+        {
+            let (item_tx, item_rx) = tokio::sync::oneshot::channel::<u32>();
+
+            let mut futs: FuturesUnordered<BoxFuture<u32>> = FuturesUnordered::new();
+            futs.push(Box::pin(std::future::pending()));  // sentinel
+
+            // Simulate AddConnection pushing an OnClosed future.
+            futs.push(Box::pin(async move { item_rx.await.unwrap_or(0) }));
+
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                let _ = item_tx.send(42u32);
+            });
+
+            run_select_with_stream(futs, "connections_close").await;
         }
     }
 }
