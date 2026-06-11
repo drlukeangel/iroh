@@ -53,6 +53,14 @@ mod remote_info;
 // Emitted by spawn_flow_gauge_reporter() in transports.rs every 5s.
 pub(crate) static FLOW_ACTOR_DRAIN_TICKS: AtomicU64 = AtomicU64::new(0);
 
+// Run-loop iteration counter: incremented every time the actor returns to the
+// top of its main select loop.  If this advances while drain_ticks flatlines,
+// the actor IS running (select loop iterating) but not consuming inbox messages
+// — i.e. a non-inbox arm is firing in a hot loop (spin).
+// If this also flatlines, the actor task itself is not being polled — either
+// the runtime is starved by another spinning task or the task waker was lost.
+pub(crate) static FLOW_RUN_LOOP_ITERS: AtomicU64 = AtomicU64::new(0);
+
 /// How often to attempt holepunching.
 ///
 /// If there have been no changes to the NAT address candidates, holepunching will not be
@@ -286,7 +294,10 @@ impl RemoteStateActor {
                     .reset(Instant::now() + ACTOR_MAX_IDLE_TIMEOUT);
             }
 
-            tokio::select! {
+            // Run-loop iteration counter: tells us if the select loop is spinning.
+        FLOW_RUN_LOOP_ITERS.fetch_add(1, Ordering::Relaxed);
+
+        tokio::select! {
                 biased;
 
                 _ = shutdown_token.cancelled() => {
@@ -298,19 +309,30 @@ impl RemoteStateActor {
                         Some(msg) => {
                             // Stage iii: actor is draining — count every message consumed.
                             FLOW_ACTOR_DRAIN_TICKS.fetch_add(1, Ordering::Relaxed);
+                            let vname = match &msg {
+                                RemoteStateMessage::SendDatagram(_, _) => "SendDatagram",
+                                RemoteStateMessage::AddConnection(_, _) => "AddConnection",
+                                RemoteStateMessage::ResolveRemote(_, _) => "ResolveRemote",
+                                RemoteStateMessage::RemoteInfo(_) => "RemoteInfo",
+                                RemoteStateMessage::NetworkChange { .. } => "NetworkChange",
+                            };
+                            eprintln!("[flow-bracket] RUN_LOOP_RECV_WOKE variant={vname}");
                             self.handle_message(msg).await;
                         }
                         None => break,
                     }
                 }
                 Some((id, evt)) = self.state.path_events.next() => {
+                    eprintln!("[flow-bracket] SELECT_ARM path_events id={id:?} evt={evt:?}");
                     self.handle_path_event(id, evt);
                 }
                 Some((id, evt)) = self.state.addr_events.next() => {
+                    eprintln!("[flow-bracket] SELECT_ARM addr_events id={id:?}");
                     trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
                     self.trigger_holepunching();
                 }
                 Some((conn_id, closed)) = self.state.connections_close.next(), if !self.state.connections_close.is_empty() => {
+                    eprintln!("[flow-bracket] SELECT_ARM connections_close conn_id={conn_id:?}");
                     self.handle_connection_close(conn_id, closed);
                 }
                 res = self.state.local_direct_addrs.updated() => {

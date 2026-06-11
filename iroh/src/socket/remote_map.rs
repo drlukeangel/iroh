@@ -41,7 +41,7 @@ use crate::{
 };
 
 mod remote_state;
-pub(crate) use remote_state::FLOW_ACTOR_DRAIN_TICKS;
+pub(crate) use remote_state::{FLOW_ACTOR_DRAIN_TICKS, FLOW_RUN_LOOP_ITERS};
 
 // TODO: use this
 // /// Number of endpoints that are inactive for which we keep info about. This limit is enforced
