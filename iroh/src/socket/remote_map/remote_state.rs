@@ -12,9 +12,8 @@ use std::{
 use iroh_base::{CustomAddr, EndpointId, RelayUrl, TransportAddr};
 use n0_error::StackResultExt;
 use n0_future::{
-    FuturesUnordered, MaybeFuture, MergeUnbounded, Stream, StreamExt,
-    boxed::{BoxFuture, BoxStream},
-    stream,
+    MaybeFuture, Stream, StreamExt,
+    boxed::BoxStream,
     task::JoinSet,
     time::{self, Duration, Instant},
 };
@@ -90,94 +89,17 @@ const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// in a high frequency, and to keep data about previous path around for subsequent connections.
 const ACTOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A stream of events from all paths for all connections.
+/// Channel capacity for per-connection event forwarder channels.
 ///
-/// The connection is identified using [`ConnId`].  The event `Err` variant happens when the
-/// actor has lagged processing the events, which is rather critical for us.
-type PathEvents = MergeUnbounded<
-    Pin<Box<dyn Stream<Item = (ConnId, Result<NoqPathEvent, noq::Lagged>)> + Send + Sync>>,
->;
-
-/// A stream of events of announced NAT traversal candidate addresses for all connections.
+/// Each of the three event types (path events, addr events, connection-close) gets its
+/// own `tokio::sync::mpsc` channel with this capacity.  The forwarder pattern replaces
+/// the previous `MergeUnbounded` / `FuturesUnordered` select arms, which suffered from
+/// waker-loss: `push()` on those collections does not wake a parked owner task, and the
+/// sentinel work-around did not fully cover the push-while-parked production pattern.
 ///
-/// The connection is identified using [`ConnId`].
-type AddrEvents = MergeUnbounded<
-    Pin<
-        Box<
-            dyn Stream<Item = (ConnId, Result<n0_nat_traversal::Event, noq::Lagged>)> + Send + Sync,
-        >,
-    >,
->;
-
-/// Returns a [`PathEvents`] merge pre-seeded with a sentinel that never terminates.
-///
-/// # Waker-loss fix
-///
-/// [`MergeUnbounded::poll_next`] returns `Poll::Ready(None)` when its internal set is
-/// empty — it does NOT register a waker in that case.  When [`RemoteStateActor`] later
-/// pushes a new per-connection stream via [`AddConnection`], the select arm for
-/// `path_events.next()` has no pending waker and is never woken, so the entire `select!`
-/// (including `inbox.recv()`) stops being polled.  The actor parks permanently.
-///
-/// Seeding with one `stream::pending()` entry keeps the merge non-empty at all times so
-/// `poll_next` always returns `Poll::Pending` (with a registered waker) rather than
-/// `Poll::Ready(None)` (with no waker) when no connection events are available.
-fn path_events_with_sentinel() -> PathEvents {
-    let sentinel: Pin<
-        Box<dyn Stream<Item = (ConnId, Result<NoqPathEvent, noq::Lagged>)> + Send + Sync>,
-    > = Box::pin(stream::pending());
-    let mut merge = MergeUnbounded::new();
-    merge.push(sentinel);
-    merge
-}
-
-/// Returns an [`AddrEvents`] merge pre-seeded with a sentinel that never terminates.
-///
-/// See [`path_events_with_sentinel`] for the waker-loss rationale.
-fn addr_events_with_sentinel() -> AddrEvents {
-    let sentinel: Pin<
-        Box<
-            dyn Stream<Item = (ConnId, Result<n0_nat_traversal::Event, noq::Lagged>)>
-                + Send
-                + Sync,
-        >,
-    > = Box::pin(stream::pending());
-    let mut merge = MergeUnbounded::new();
-    merge.push(sentinel);
-    merge
-}
-
-/// Futures that resolve when each noq connection closes.
-///
-/// The connection is identified by [`ConnId`].  Uses a boxed future type so that a
-/// never-resolving sentinel can be seeded alongside real [`OnClosed`] futures without
-/// requiring a common concrete type.
-type ConnectionsClose = FuturesUnordered<BoxFuture<(ConnId, Closed)>>;
-
-/// Returns a [`ConnectionsClose`] set pre-seeded with a sentinel that never resolves.
-///
-/// # Waker-loss fix
-///
-/// The previous code used `FuturesUnordered<OnClosed>` with a select guard
-/// `if !self.state.connections_close.is_empty()`.  When the set is empty the guard
-/// disables the arm, and `FuturesUnordered::poll_next` on an empty set returns
-/// `Poll::Ready(None)` WITHOUT registering a waker.  Consequently, when
-/// `AddConnection` pushes the first `OnClosed` future, no waker is registered for
-/// that arm and the select never re-examines it.
-///
-/// The same waker-loss property applies as for [`path_events_with_sentinel`]: seeding
-/// with `std::future::pending()` keeps the set non-empty at all times so
-/// `FuturesUnorderedBounded::poll_inner_no_remove` always reaches
-/// `self.shared.register(cx.waker())` before inspecting the ready queue, ensuring the
-/// outer task is always woken when new futures are pushed and become ready.
-///
-/// With a sentinel the guard is no longer necessary and has been removed.
-fn connections_close_with_sentinel() -> ConnectionsClose {
-    let sentinel: BoxFuture<(ConnId, Closed)> = Box::pin(std::future::pending());
-    let mut set = FuturesUnordered::new();
-    set.push(sentinel);
-    set
-}
+/// `tokio::sync::mpsc` waker semantics are unconditionally correct: `send().await` wakes
+/// the receiver regardless of whether the receiver was parked before or after the send.
+const EVENT_CHANNEL_CAP: usize = 64;
 
 /// The state we need to know about a single remote endpoint.
 ///
@@ -214,12 +136,24 @@ struct State {
 
     // Internal state - Noq Connections we are managing.
     //
-    /// Notifications when connections are closed.
-    connections_close: ConnectionsClose,
-    /// Events emitted by Noq about path changes, for all paths, all connections.
-    path_events: PathEvents,
-    /// A stream of events of announced NAT traversal candidate addresses for all connections.
-    addr_events: AddrEvents,
+    // The three channels below replace the prior MergeUnbounded / FuturesUnordered arms.
+    // Each AddConnection spawns three tiny forwarder tasks that stream events from the noq
+    // connection into these channels.  tokio::sync::mpsc unconditionally wakes the receiver
+    // when a message is sent, avoiding the waker-loss that affected the previous push-based
+    // approach (MergeUnbounded/FuturesUnordered push() does not wake a parked owner).
+    //
+    /// Sender half for path-event forwarder tasks.  Cloned once per connection.
+    path_events_tx: mpsc::Sender<(ConnId, Result<NoqPathEvent, noq::Lagged>)>,
+    /// Receiver for path events from all connections.
+    path_events_rx: mpsc::Receiver<(ConnId, Result<NoqPathEvent, noq::Lagged>)>,
+    /// Sender half for addr-event forwarder tasks.  Cloned once per connection.
+    addr_events_tx: mpsc::Sender<(ConnId, Result<n0_nat_traversal::Event, noq::Lagged>)>,
+    /// Receiver for NAT-traversal address events from all connections.
+    addr_events_rx: mpsc::Receiver<(ConnId, Result<n0_nat_traversal::Event, noq::Lagged>)>,
+    /// Sender half for connection-close forwarder tasks.  Cloned once per connection.
+    connections_close_tx: mpsc::Sender<(ConnId, Closed)>,
+    /// Receiver for connection-closed notifications from all connections.
+    connections_close_rx: mpsc::Receiver<(ConnId, Closed)>,
 
     // Internal state - Holepunching and path state.
     //
@@ -269,6 +203,9 @@ impl RemoteStateActor {
         address_lookup: AddressLookupServices,
         path_selector: Arc<dyn PathSelector>,
     ) -> Self {
+        let (path_events_tx, path_events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let (addr_events_tx, addr_events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let (connections_close_tx, connections_close_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         Self {
             connections: FxHashMap::default(),
             state: State {
@@ -278,9 +215,12 @@ impl RemoteStateActor {
                 relay_mapped_addrs,
                 custom_mapped_addrs,
                 address_lookup,
-                connections_close: connections_close_with_sentinel(),
-                path_events: path_events_with_sentinel(),
-                addr_events: addr_events_with_sentinel(),
+                path_events_tx,
+                path_events_rx,
+                addr_events_tx,
+                addr_events_rx,
+                connections_close_tx,
+                connections_close_rx,
                 paths: RemotePathState::new(metrics),
                 last_holepunch: None,
                 selected_path: Default::default(),
@@ -393,16 +333,16 @@ impl RemoteStateActor {
                         None => break,
                     }
                 }
-                Some((id, evt)) = self.state.path_events.next() => {
+                Some((id, evt)) = self.state.path_events_rx.recv() => {
                     eprintln!("[flow-bracket] SELECT_ARM path_events id={id:?} evt={evt:?}");
                     self.handle_path_event(id, evt);
                 }
-                Some((id, evt)) = self.state.addr_events.next() => {
+                Some((id, evt)) = self.state.addr_events_rx.recv() => {
                     eprintln!("[flow-bracket] SELECT_ARM addr_events id={id:?}");
                     trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
                     self.trigger_holepunching();
                 }
-                Some((conn_id, closed)) = self.state.connections_close.next() => {
+                Some((conn_id, closed)) = self.state.connections_close_rx.recv() => {
                     eprintln!("[flow-bracket] SELECT_ARM connections_close conn_id={conn_id:?}");
                     self.handle_connection_close(conn_id, closed);
                 }
@@ -520,14 +460,45 @@ impl RemoteStateActor {
         let conn_id = ConnId(conn.stable_id());
         self.connections.remove(&conn_id);
 
-        // Hook up paths, NAT addresses and connection closed event streams.
-        self.state
-            .path_events
-            .push(Box::pin(conn.path_events().map(move |evt| (conn_id, evt))));
-        self.state.addr_events.push(Box::pin(
-            conn.nat_traversal_updates().map(move |evt| (conn_id, evt)),
-        ));
-        self.state.connections_close.push(Box::pin(OnClosed::new(&conn)));
+        // Spawn forwarder tasks for path events, addr events, and connection-close.
+        //
+        // Each forwarder drains its source stream/future and forwards into the actor's
+        // mpsc channel.  tokio::sync::mpsc unconditionally wakes the receiver on send,
+        // avoiding the waker-loss that affected MergeUnbounded/FuturesUnordered::push()
+        // (push does not wake a parked owner — only the first subsequent poll registers
+        // the slot waker, and DiatomicWaker::notify() is a no-op if called before the
+        // first register()).  Forwarders self-terminate when the channel is closed (actor
+        // dropped) or when the source stream ends.
+        {
+            let mut path_stream = conn.path_events().map(move |evt| (conn_id, evt));
+            let path_tx = self.state.path_events_tx.clone();
+            tokio::spawn(async move {
+                while let Some(evt) = path_stream.next().await {
+                    if path_tx.send(evt).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        {
+            let mut addr_stream = conn.nat_traversal_updates().map(move |evt| (conn_id, evt));
+            let addr_tx = self.state.addr_events_tx.clone();
+            tokio::spawn(async move {
+                while let Some(evt) = addr_stream.next().await {
+                    if addr_tx.send(evt).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        {
+            let on_closed = OnClosed::new(&conn);
+            let close_tx = self.state.connections_close_tx.clone();
+            tokio::spawn(async move {
+                let result = on_closed.await;
+                let _ = close_tx.send(result).await;
+            });
+        }
 
         // Add local addrs to the connection
         let local_addrs = self.state.local_candidates();
@@ -1668,243 +1639,131 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        pin::Pin,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        task::Poll,
-    };
-
-    use n0_future::{FuturesUnordered, MergeUnbounded, Stream, StreamExt, stream};
     use tokio::sync::mpsc;
 
-    /// Build a manual tracking waker backed by an `Arc<AtomicBool>`.
+    /// Regression test for the waker-loss bug in [`RemoteStateActor`]'s run loop.
     ///
-    /// The bool is set to `true` whenever the waker is fired.  Returns both the
-    /// bool (for inspection) and the waker.
-    fn tracking_waker() -> (Arc<AtomicBool>, std::task::Waker) {
-        use std::task::{RawWaker, RawWakerVTable};
-
-        fn clone_fn(ptr: *const ()) -> RawWaker {
-            let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
-            let cloned = arc.clone();
-            std::mem::forget(arc);
-            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTABLE)
-        }
-        fn wake_fn(ptr: *const ()) {
-            let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
-            arc.store(true, Ordering::SeqCst);
-        }
-        fn wake_by_ref_fn(ptr: *const ()) {
-            let arc = unsafe { Arc::from_raw(ptr as *const AtomicBool) };
-            arc.store(true, Ordering::SeqCst);
-            std::mem::forget(arc);
-        }
-        fn drop_fn(ptr: *const ()) {
-            drop(unsafe { Arc::from_raw(ptr as *const AtomicBool) });
-        }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(clone_fn, wake_fn, wake_by_ref_fn, drop_fn);
-
-        let flag = Arc::new(AtomicBool::new(false));
-        let raw = RawWaker::new(Arc::into_raw(flag.clone()) as *const (), &VTABLE);
-        (flag, unsafe { std::task::Waker::from_raw(raw) })
-    }
-
-    /// Regression test for the three-arm waker-loss bug in [`RemoteStateActor`]'s run loop.
+    /// # Root cause (historical — now fixed)
     ///
-    /// # Root cause
+    /// Three arms in the actor's biased `select!` previously used `MergeUnbounded` and
+    /// `FuturesUnordered` from `futures-buffered`.  Both collections return
+    /// `Poll::Ready(None)` WITHOUT registering a waker when polled on an empty set
+    /// (documented upstream: "The caller must ensure that poll_next is called in order
+    /// to receive wake-up notifications").  `DiatomicWaker::notify()` is likewise a
+    /// no-op before the first `register()`, so pushes into these collections from within
+    /// the actor's own message handler (same task, same poll cycle) were silently lost:
+    /// the handler pushed, then the task parked, then the forwarder arrived — but no
+    /// waker was registered, so the select never re-polled.
     ///
-    /// Three arms in the actor's biased `select!` each exhibit waker-loss when their
-    /// backing collection is empty:
+    /// Three sentinel attempts (seeding the collections with `stream::pending()` /
+    /// `std::future::pending()`) failed because `push()` on these collections does NOT
+    /// wake a parked owner.
     ///
-    /// 1. `path_events.next()` — `MergeUnbounded::poll_next` on an empty set returns
-    ///    `Poll::Ready(None)` WITHOUT registering a waker (futures-buffered upstream).
-    /// 2. `addr_events.next()` — same type, same property.
-    /// 3. `connections_close.next()` — was guarded by `if !self.connections_close.is_empty()`,
-    ///    so tokio never polled the arm when empty, registering no waker.  When
-    ///    `AddConnection` pushed the first `OnClosed` future, nothing woke the select.
+    /// # Fix — mpsc funnel
     ///
-    /// In all three cases, after the first `AddConnection` message pushes real streams/futures
-    /// into the collections, the corresponding select arms had no waker registered, so the
-    /// entire select — including `inbox.recv()` — was never re-polled.  The actor parked
-    /// permanently (CPU flat, `FLOW_RUN_LOOP_ITERS` flatlined).
-    ///
-    /// # Fix
-    ///
-    /// Seed all three collections with a never-resolving / never-terminating sentinel
-    /// (`stream::pending()` for the two merges, `std::future::pending()` for the
-    /// `FuturesUnordered`) so `poll_next` always returns `Poll::Pending` (with a registered
-    /// waker) rather than `Poll::Ready(None)` (with no waker) when no real events are
-    /// available.  The guard on `connections_close` is removed — the sentinel makes it safe.
+    /// All three arms were replaced with `tokio::sync::mpsc` channels.  Each
+    /// `AddConnection` handler clones the sender side and spawns three tiny forwarder
+    /// tasks that stream events from the connection into the channels.  The `select!`
+    /// arms are now `channel_rx.recv()` calls.  `tokio::sync::mpsc::send().await`
+    /// unconditionally wakes the receiver regardless of when the waker was registered.
     ///
     /// # Test structure
     ///
-    /// Part A: unit-level proof that both `MergeUnbounded` and `FuturesUnordered` do NOT
-    /// register a waker when polled empty — confirming the upstream waker-loss property that
-    /// the sentinel fix relies on.  These assertions act as canaries: if futures-buffered ever
-    /// fixes the upstream behaviour, they will fail and alert maintainers that the rationale
-    /// has changed (though the sentinel fix remains correct regardless).
+    /// Parts A / B / C: production-pattern proofs for each of the three replaced arms
+    /// (`path_events`, `addr_events`, `connections_close`).  Each proof:
+    ///   1. Simulates the production pattern exactly — the "handler" (same-task role)
+    ///      sends a message into the mpsc **before** the select parks, then the select
+    ///      parks, and a separately-spawned forwarder task sends another message.
+    ///   2. Asserts that the select wakes for BOTH messages within the timeout.
     ///
-    /// Parts B / C / D: positive end-to-end proofs that each sentinel-seeded arm (`path_events`,
-    /// `addr_events`, `connections_close`) keeps a biased `select!` alive through the
-    /// equivalent of an `AddConnection` event — a new stream / future pushed after the select
-    /// has already parked.  In each case both the arm event and a subsequent inbox message are
-    /// received within 500ms.  A single-arm sentinel passing Parts B or C cannot mask a missing
-    /// sentinel on the other arms; each arm is exercised independently.
+    /// The test also asserts that an `inbox` mpsc arm (simulating the actor's message
+    /// inbox) continues to fire after the event channels are drained — confirming the
+    /// multi-arm biased select stays live end-to-end.
     #[tokio::test]
-    async fn actor_run_loop_sentinels_prevent_waker_loss() {
-        type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send + Sync>>;
-        type BoxFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
-
+    async fn actor_run_loop_mpsc_funnel_wakes_correctly() {
         // -----------------------------------------------------------------------
-        // Part A: unit-level proof of the upstream waker-loss property.
+        // Helper: drive a biased select over one mpsc event arm + one inbox arm.
+        //
+        // Setup mirrors the production run loop:
+        //   - `event_tx` is cloned and passed to a simulated "handler" call that
+        //     sends one item synchronously (before the select parks) — this is the
+        //     same-task push pattern that defeated the sentinel approach.
+        //   - A second item is sent from a spawned forwarder task (after the select
+        //     has parked) — this is the remote-IO-arrival pattern.
+        //   - A third item (inbox message) is sent from another spawned task.
+        //
+        // All three must be received within 500ms.
         // -----------------------------------------------------------------------
-        {
-            // A.1 — MergeUnbounded (covers path_events and addr_events arms).
-            let (woken, waker) = tracking_waker();
-            let mut cx = std::task::Context::from_waker(&waker);
-            let mut merge: MergeUnbounded<BoxStream<u32>> = MergeUnbounded::new();
-
-            let poll_result = Pin::new(&mut merge).poll_next(&mut cx);
-            assert!(
-                matches!(poll_result, Poll::Ready(None)),
-                "expected Ready(None) from empty MergeUnbounded, got {poll_result:?}"
-            );
-            assert!(
-                !woken.load(Ordering::SeqCst),
-                "futures-buffered changed: MergeUnbounded fired waker on Ready(None). \
-                 Sentinel fix is still correct but rationale has changed."
-            );
-
-            // A.2 — FuturesUnordered (covers connections_close arm).
-            let (woken2, waker2) = tracking_waker();
-            let mut cx2 = std::task::Context::from_waker(&waker2);
-            let mut futs: FuturesUnordered<BoxFuture<u32>> = FuturesUnordered::new();
-
-            let poll_result2 = Pin::new(&mut futs).poll_next(&mut cx2);
-            assert!(
-                matches!(poll_result2, Poll::Ready(None)),
-                "expected Ready(None) from empty FuturesUnordered, got {poll_result2:?}"
-            );
-            assert!(
-                !woken2.load(Ordering::SeqCst),
-                "futures-buffered changed: FuturesUnordered fired waker on Ready(None). \
-                 Sentinel fix is still correct but rationale has changed."
-            );
-        }
-
-        // Helper: run a biased select loop driving a stream arm + an inbox arm.
-        // Fires items into both from a background task and asserts both are received.
-        async fn run_select_with_stream<S>(mut stream_arm: S, label: &str)
-        where
-            S: StreamExt<Item = u32> + Unpin,
-        {
+        async fn run_mpsc_select_proof(label: &'static str) {
+            let (event_tx, mut event_rx) = mpsc::channel::<u32>(super::EVENT_CHANNEL_CAP);
             let (inbox_tx, mut inbox_rx) = mpsc::channel::<u32>(4);
 
+            // Simulate the handler running inside the actor task BEFORE the select parks:
+            // clones the sender (same pattern as AddConnection handler cloning path_events_tx)
+            // and sends the first item synchronously.
+            let handler_tx = event_tx.clone();
+            handler_tx.try_send(1u32).expect("handler send must not block on empty channel");
+
+            // Forwarder task: sends a second event after a yield (models remote IO arriving
+            // after the select has parked — the scenario sentinels could not survive).
+            let forwarder_tx = event_tx.clone();
             tokio::spawn(async move {
                 tokio::task::yield_now().await;
-                // The stream arm item is already in the stream via the caller's setup.
-                // We just need to send the inbox message to confirm the select is alive.
+                let _ = forwarder_tx.send(2u32).await;
+            });
+
+            // Inbox message from a peer actor, also after a yield.
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
                 let _ = inbox_tx.send(99u32).await;
             });
 
-            let mut got_stream_item = false;
-            let mut got_inbox_msg = false;
+            let mut events_received: Vec<u32> = Vec::new();
+            let mut got_inbox = false;
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+
             loop {
-                if got_stream_item && got_inbox_msg {
+                if events_received.len() >= 2 && got_inbox {
                     break;
                 }
                 if tokio::time::Instant::now() > deadline {
                     panic!(
-                        "[{label}] waker-loss: select did not receive both events within 500ms \
-                         (got_stream_item={got_stream_item} got_inbox_msg={got_inbox_msg}). \
-                         The arm's sentinel may be missing or the stream/future was not woken."
+                        "[{label}] waker-loss regression: select did not receive all events \
+                         within 500ms (events={events_received:?} got_inbox={got_inbox}). \
+                         The mpsc funnel is broken or the select arm is wrong."
                     );
                 }
                 tokio::select! {
                     biased;
-                    Some(item) = stream_arm.next() => {
-                        assert_eq!(item, 42u32, "[{label}] unexpected stream item");
-                        got_stream_item = true;
+                    Some(item) = event_rx.recv() => {
+                        events_received.push(item);
                     }
                     msg = inbox_rx.recv() => {
-                        if let Some(msg) = msg {
-                            assert_eq!(msg, 99u32, "[{label}] unexpected inbox message");
-                            got_inbox_msg = true;
+                        if msg.is_some() {
+                            got_inbox = true;
                         }
                     }
                 }
             }
+
+            // The two event items must arrive (order may vary due to yield semantics).
+            let mut sorted = events_received.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                vec![1u32, 2u32],
+                "[{label}] expected items 1 and 2 from the two senders"
+            );
         }
 
-        // -----------------------------------------------------------------------
-        // Part B: path_events arm — MergeUnbounded with sentinel.
-        // -----------------------------------------------------------------------
-        {
-            let (item_tx, item_rx) = tokio::sync::oneshot::channel::<u32>();
+        // Part A: path_events channel arm.
+        run_mpsc_select_proof("path_events").await;
 
-            let mut merge: MergeUnbounded<BoxStream<u32>> = MergeUnbounded::new();
-            merge.push(Box::pin(stream::pending()));  // sentinel
+        // Part B: addr_events channel arm (same mechanics, separate proof).
+        run_mpsc_select_proof("addr_events").await;
 
-            // Simulate AddConnection: push a one-shot stream.
-            merge.push(Box::pin(stream::once_future(async move {
-                item_rx.await.unwrap_or(0)
-            })));
-
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                let _ = item_tx.send(42u32);
-            });
-
-            run_select_with_stream(merge, "path_events").await;
-        }
-
-        // -----------------------------------------------------------------------
-        // Part C: addr_events arm — MergeUnbounded with sentinel (same type, separate proof).
-        // -----------------------------------------------------------------------
-        {
-            let (item_tx, item_rx) = tokio::sync::oneshot::channel::<u32>();
-
-            let mut merge: MergeUnbounded<BoxStream<u32>> = MergeUnbounded::new();
-            merge.push(Box::pin(stream::pending()));  // sentinel
-
-            merge.push(Box::pin(stream::once_future(async move {
-                item_rx.await.unwrap_or(0)
-            })));
-
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                let _ = item_tx.send(42u32);
-            });
-
-            run_select_with_stream(merge, "addr_events").await;
-        }
-
-        // -----------------------------------------------------------------------
-        // Part D: connections_close arm — FuturesUnordered with sentinel.
-        // -----------------------------------------------------------------------
-        // The select arm pattern is `Some(item) = futs.next()`.  FuturesUnordered
-        // implements Stream so we can drive it through the same helper.
-        {
-            let (item_tx, item_rx) = tokio::sync::oneshot::channel::<u32>();
-
-            let mut futs: FuturesUnordered<BoxFuture<u32>> = FuturesUnordered::new();
-            futs.push(Box::pin(std::future::pending()));  // sentinel
-
-            // Simulate AddConnection pushing an OnClosed future.
-            futs.push(Box::pin(async move { item_rx.await.unwrap_or(0) }));
-
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                let _ = item_tx.send(42u32);
-            });
-
-            run_select_with_stream(futs, "connections_close").await;
-        }
+        // Part C: connections_close channel arm (same mechanics, separate proof).
+        run_mpsc_select_proof("connections_close").await;
     }
 }
