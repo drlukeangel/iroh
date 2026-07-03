@@ -43,7 +43,7 @@ use n0_future::{
 use rand::seq::IteratorRandom;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, trace, warn, warn_span};
+use tracing::{Instrument, debug, error, info_span, trace, warn};
 use url::Host;
 
 #[cfg(not(wasm_browser))]
@@ -114,10 +114,12 @@ impl Client {
     ///
     /// The actor starts running immediately and only generates a single report, after which
     /// it shuts down.  Dropping this handle will abort the actor.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         last_report: Option<Report>,
         relay_map: RelayMap,
         protocols: BTreeSet<Probe>,
+        captive_portal_check: bool,
         if_state: IfStateDetails,
         shutdown_token: CancellationToken,
         #[cfg(not(wasm_browser))] socket_state: SocketState,
@@ -129,6 +131,7 @@ impl Client {
             last_report,
             relay_map,
             protocols,
+            captive_portal_check,
             #[cfg(not(wasm_browser))]
             socket_state,
             #[cfg(not(wasm_browser))]
@@ -138,7 +141,7 @@ impl Client {
         let task = task::spawn(
             actor
                 .run(shutdown_token)
-                .instrument(warn_span!("reportgen-actor")),
+                .instrument(info_span!("reportgen-actor")),
         );
         (
             Self {
@@ -166,6 +169,9 @@ struct Actor {
     /// Protocols we should attempt to create probes for, if we have the correct
     /// configuration for that protocol.
     protocols: BTreeSet<Probe>,
+
+    /// Whether to check for captive portals.
+    captive_portal_check: bool,
 
     /// Any socket-related state that doesn't exist/work in browsers
     #[cfg(not(wasm_browser))]
@@ -275,7 +281,7 @@ impl Actor {
         // delay by a bit to wait for UDP QAD to finish, to avoid the probe if
         // it's unnecessary.
         #[cfg(not(wasm_browser))]
-        if self.last_report.is_none() {
+        if self.captive_portal_check && self.last_report.is_none() {
             // Even if we're doing a non-incremental update, we may want to try our
             // preferred relay for captive portal detection.
             let preferred_relay = self
@@ -331,7 +337,7 @@ impl Actor {
                     };
                     ProbeFinished::CaptivePortal(res)
                 }
-                .instrument(warn_span!("captive-portal")),
+                .instrument(info_span!("captive-portal")),
             );
         }
         token
@@ -402,7 +408,7 @@ impl Actor {
                         };
                         ProbeFinished::Regular(res)
                     }
-                    .instrument(warn_span!(
+                    .instrument(info_span!(
                         "run-probe",
                         ?proto,
                         ?delay,

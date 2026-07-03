@@ -1,6 +1,6 @@
 //! TLS configuration for iroh.
 //!
-//! Currently there is one mechanisms available
+//! Currently there is one mechanism available:
 //! - Raw Public Keys, using the TLS extension described in [RFC 7250]
 //!
 //! [RFC 7250]: https://datatracker.ietf.org/doc/html/rfc7250
@@ -18,6 +18,8 @@ pub(crate) mod name;
 mod resolver;
 mod verifier;
 
+#[allow(deprecated)] // Re-export of backwards-compatibility item
+pub use iroh_relay::tls::CaRootsConfig;
 pub use iroh_relay::tls::CaTlsConfig;
 #[cfg(with_crypto_provider)]
 pub use iroh_relay::tls::default_provider;

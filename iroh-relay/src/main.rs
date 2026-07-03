@@ -21,8 +21,9 @@ use iroh_relay::{
         self as relay, Access, AccessControl, AcmeConfig, ClientRateLimit, ClientRequest,
         DEFAULT_CERT_RELOAD_INTERVAL, QuicConfig, reloading_resolver,
     },
+    tls::CaTlsConfig,
 };
-use n0_error::{Result, StdResultExt, bail_any};
+use n0_error::{AnyError, Result, StdResultExt, bail_any};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -35,6 +36,12 @@ const DEV_MODE_HTTP_PORT: u16 = 3340;
 const X_IROH_ENDPOINT_ID: &str = "X-Iroh-NodeId";
 /// Environment variable to read a bearer token for HTTP auth requests from.
 const ENV_HTTP_BEARER_TOKEN: &str = "IROH_RELAY_HTTP_BEARER_TOKEN";
+/// Environment variable to verify relay access (without an external auth service)
+const ENV_RELAY_ACCESS_TOKEN: &str = "IROH_RELAY_ACCESS_TOKEN";
+/// Environment variable to override the ACME directory URL.
+const ENV_ACME_URL: &str = "IROH_RELAY_ACME_URL";
+/// Environment variable to trust an additional CA for the ACME server's TLS certificate.
+const ENV_ACME_CA: &str = "IROH_RELAY_ACME_CA";
 
 /// A relay server for iroh.
 #[derive(Parser, Debug, Clone)]
@@ -166,6 +173,27 @@ enum AccessConfig {
     /// To grant access, the HTTP endpoint must return a `200` response with `true` as the response text.
     /// In all other cases, the endpoint will be denied access.
     Http(HttpAccessConfig),
+    #[serde(rename = "shared_token")]
+    /// Allows only clients that present one of the configured bearer tokens.
+    ///
+    /// The token is read from the `Authorization: Bearer <token>` request header,
+    /// or from the `?token=` URL query parameter as a fallback.
+    /// All other connections are denied.
+    ///
+    /// The token list can also be overridden by the `IROH_RELAY_ACCESS_TOKEN` environment
+    /// variable, which sets a single allowed token and takes precedence over the config
+    /// file value. A single value is used (rather than a comma-separated list) to avoid
+    /// restricting the character set of tokens.
+    ///
+    /// The token list must not be empty, and no token may be an empty string;
+    /// the server will fail to start if either condition is violated.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// access.shared_token = ["token-a", "token-b"]
+    /// ```
+    SharedToken(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,12 +209,14 @@ struct HttpAccessConfig {
     bearer_token: Option<String>,
 }
 
-impl From<AccessConfig> for Arc<dyn iroh_relay::server::DynAccessControl> {
-    fn from(cfg: AccessConfig) -> Self {
+impl TryFrom<AccessConfig> for Arc<dyn iroh_relay::server::DynAccessControl> {
+    type Error = AnyError;
+
+    fn try_from(cfg: AccessConfig) -> Result<Self> {
         match cfg {
-            AccessConfig::Everyone => Arc::new(iroh_relay::server::AllowAll),
-            AccessConfig::Allowlist(allow_list) => Arc::new(AllowlistAccess(allow_list)),
-            AccessConfig::Denylist(deny_list) => Arc::new(DenylistAccess(deny_list)),
+            AccessConfig::Everyone => Ok(Arc::new(iroh_relay::server::AllowAll)),
+            AccessConfig::Allowlist(allow_list) => Ok(Arc::new(AllowlistAccess(allow_list))),
+            AccessConfig::Denylist(deny_list) => Ok(Arc::new(DenylistAccess(deny_list))),
             AccessConfig::Http(mut config) => {
                 let client = reqwest::Client::builder()
                     .use_rustls_tls()
@@ -196,7 +226,18 @@ impl From<AccessConfig> for Arc<dyn iroh_relay::server::DynAccessControl> {
                 if let Ok(token) = std::env::var(ENV_HTTP_BEARER_TOKEN) {
                     config.bearer_token = Some(token);
                 }
-                Arc::new(HttpAccess { client, config })
+                Ok(Arc::new(HttpAccess { client, config }))
+            }
+            AccessConfig::SharedToken(mut tokens) => {
+                // A single env var token replaces the entire list. A comma-separated list
+                // is intentionally not supported to avoid restricting the token character set.
+                if let Ok(env_token) = std::env::var(ENV_RELAY_ACCESS_TOKEN) {
+                    tokens = vec![env_token];
+                }
+                if tokens.is_empty() || tokens.iter().any(|t| t.is_empty()) {
+                    bail_any!("access.shared_token must not be empty or contain empty strings");
+                }
+                Ok(Arc::new(SharedTokenAccess(tokens)))
             }
         }
     }
@@ -226,6 +267,19 @@ impl AccessControl for DenylistAccess {
             Access::Deny { reason: None }
         } else {
             Access::Allow
+        }
+    }
+}
+
+/// An [`AccessControl`] admitting only clients that present one of the configured bearer tokens.
+#[derive(Debug)]
+struct SharedTokenAccess(Vec<String>);
+
+impl AccessControl for SharedTokenAccess {
+    async fn on_connect(&self, request: &ClientRequest) -> Access {
+        match request.auth_token() {
+            Some(token) if self.0.contains(&token) => Access::Allow,
+            _ => Access::Deny { reason: None },
         }
     }
 }
@@ -351,7 +405,8 @@ struct TlsConfig {
     /// port set to [`iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT`]
     quic_bind_addr: Option<SocketAddr>,
     /// Certificate hostname when using LetsEncrypt.
-    hostname: Option<String>,
+    #[serde(default, deserialize_with = "string_or_seq")]
+    hostname: Vec<String>,
     /// Mode for getting a cert.
     ///
     /// Possible options: 'Manual', 'LetsEncrypt'.
@@ -428,6 +483,23 @@ impl TlsConfig {
             .clone()
             .unwrap_or_else(|| self.cert_dir().join("default.key"))
     }
+}
+
+fn string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match StringOrVec::deserialize(deserializer)? {
+        StringOrVec::One(s) => vec![s],
+        StringOrVec::Many(v) => v,
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -565,18 +637,34 @@ async fn load_cert_config(tls: &TlsConfig) -> Result<relay::CertConfig> {
             relay::CertConfig::Manual { server_config }
         }
         CertMode::LetsEncrypt => {
-            let hostname = tls
-                .hostname
-                .clone()
-                .std_context("LetsEncrypt needs a hostname")?;
+            let domains = tls.hostname.clone();
+            if domains.is_empty() {
+                bail_any!("LetsEncrypt needs at least one hostname");
+            }
             let contact = tls
                 .contact
                 .clone()
                 .std_context("LetsEncrypt needs a contact email")?;
-            let acme_config = AcmeConfig::letsencrypt(tls.prod_tls)
-                .domains(vec![hostname])
+            let acme_config = if let Ok(url) = std::env::var(ENV_ACME_URL) {
+                AcmeConfig::new(url)
+            } else {
+                AcmeConfig::letsencrypt(tls.prod_tls)
+            };
+            let mut acme_config = acme_config
+                .domains(domains)
                 .contact(vec![format!("mailto:{contact}")])
                 .cache_path(tls.cert_dir());
+            // Trust an additional CA for the ACME server's TLS certificate. Useful for testing
+            // against a local ACME server such as pebble, whose certificate is not signed by a
+            // publicly trusted CA.
+            if let Ok(ca_path) = std::env::var(ENV_ACME_CA) {
+                let extra_roots = CertificateDer::pem_file_iter(&ca_path)
+                    .std_context("failed to read IROH_RELAY_ACME_CA")?
+                    .collect::<Result<Vec<_>, _>>()
+                    .std_context("failed to parse IROH_RELAY_ACME_CA")?;
+                acme_config =
+                    acme_config.tls_config(CaTlsConfig::default().with_extra_roots(extra_roots));
+            }
             relay::CertConfig::LetsEncrypt {
                 acme_config,
                 server_config_builder: server_config,
@@ -676,7 +764,7 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
         relay_config.tls = tls_config;
         relay_config.limits = limits;
         relay_config.key_cache_capacity = cfg.key_cache_capacity;
-        relay_config.access = cfg.access.clone().into();
+        relay_config.access = cfg.access.clone().try_into()?;
         Some(relay_config)
     } else {
         None
@@ -808,6 +896,39 @@ mod tests {
                 url: "https://example.com/foo".parse().unwrap(),
                 bearer_token: Some("foo".to_string())
             })
+        );
+
+        let config = r#"
+            access.shared_token = ["token-a", "token-b"]
+        "#
+        .to_string();
+        let config = Config::from_str(dbg!(&config))?;
+        assert_eq!(
+            config.access,
+            AccessConfig::SharedToken(vec!["token-a".to_string(), "token-b".to_string()])
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_access_token_empty_is_rejected() -> Result {
+        let config = r#"
+            access.shared_token = []
+        "#;
+        let config = Config::from_str(config)?;
+        assert!(
+            build_relay_config(config).await.is_err(),
+            "empty token list should be rejected at startup"
+        );
+
+        let config = r#"
+            access.shared_token = [""]
+        "#;
+        let config = Config::from_str(config)?;
+        assert!(
+            build_relay_config(config).await.is_err(),
+            "empty string token should be rejected at startup"
         );
         Ok(())
     }

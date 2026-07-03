@@ -43,7 +43,7 @@ pub(crate) const AUTH_TOKEN_URL_QUERY_PARAM: &str = "token";
     strum::IntoStaticStr,
 )]
 // Only used by the `all_is_exhaustive` to validate that `Self::ALL` is up to date.
-#[cfg_attr(test, derive(strum::EnumCount))]
+#[cfg_attr(test, derive(strum::EnumCount, test_strategy::Arbitrary))]
 #[strum(parse_err_ty = UnsupportedRelayProtocolVersion, parse_err_fn = strum_err_fn)]
 #[non_exhaustive]
 // Needs to be ordered with newest version last, so that the `Ord` impl orders by latest version as max.
@@ -77,7 +77,7 @@ impl ProtocolVersion {
         Self::all().collect::<Vec<_>>().join(", ")
     }
 
-    /// Returns all supported protocol versions in a comma-seperated string as an HTTP header value.
+    /// Returns all supported protocol versions in a comma-separated string as an HTTP header value.
     pub fn all_as_header_value() -> HeaderValue {
         HeaderValue::from_bytes(Self::all_joined().as_bytes()).expect("valid header name")
     }

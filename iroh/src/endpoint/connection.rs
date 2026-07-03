@@ -214,7 +214,7 @@ impl Incoming {
         self.inner.remote_address_validated()
     }
 
-    /// Decrypt the Initial packet payload
+    /// Decrypts the Initial packet payload.
     ///
     /// This clones and decrypts the packet payload (~1200 bytes).
     /// Can be used to extract information from the TLS ClientHello without completing the handshake.
@@ -811,9 +811,65 @@ pub struct RemoteEndpointIdError;
 impl<T: ConnectionState> Connection<T> {
     /// Initiates a new outgoing unidirectional stream.
     ///
-    /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
-    /// consequence, the peer won’t be notified that a stream has been opened until the
-    /// stream is actually used.
+    /// A unidirectional stream can only transmit data from the endpoint which opens the
+    /// stream, the endpoint accepting the stream can not send any data back on the same
+    /// stream.
+    ///
+    /// # QUIC streams
+    ///
+    /// QUIC can multiplex many streams onto a single connection. Streams can be short or
+    /// long lived and may be opened and closed without incurring any extra cost. The data
+    /// sent in each stream is delivered strictly ordered, yet multiple streams will be
+    /// transmitted interleaved and packet loss on one stream will not delay other
+    /// streams. Thus streams do not suffer head-of-line blocking.
+    ///
+    /// # Opening streams
+    ///
+    /// Both peers of a connection can open streams at any time. Opening a new stream does
+    /// not incur any extra overhead compared to sending data on an existing stream. However
+    /// only once some data has been transmitted on the stream, will the peer become aware
+    /// of the newly opened stream.
+    ///
+    /// # Accepting streams
+    ///
+    /// Each stream needs to be *accepted* by the peer, using either [`Self::accept_uni`] or
+    /// [`Self::accept_bi`] depending on the stream type. Repeated accept call will yield a
+    /// new stream whenever the peer opens a new stream.
+    ///
+    /// Note that opening a stream is not sufficient for the accept call to yield a new
+    /// stream. Data must be sent on a stream before the respective accept call at the peer
+    /// will yield a [`RecvStream`].
+    ///
+    /// # Stream priorities
+    ///
+    /// Streams can have different priorities set using [`SendStream::set_priority`]. Data
+    /// of streams with a higher priority will be transmitted to the peer before data from
+    /// streams with a lower priority.
+    ///
+    /// # Stream limits
+    ///
+    /// The number of streams which can be open concurrently defaults to
+    /// [`QuicTransportConfigBuilder::max_concurrent_uni_streams`] and
+    /// [`QuicTransportConfigBuilder::max_concurrent_bidi_streams`]. While the connection is
+    /// open these limits can be changed using [`Self::set_max_concurrent_uni_streams`] and
+    /// [`Self::set_max_concurrent_bi_streams`].
+    ///
+    /// Each stream has a *receive window* of a maximum number of bytes that may be
+    /// in-flight before the sender is blocked from transmitting more. This is configured in
+    /// [`QuicTransportConfigBuilder::stream_receive_window`]. There is also a
+    /// [`QuicTransportConfigBuilder::receive_window`] which applies to all streams combined
+    /// and can be changed during a connection using [`Self::set_receive_window`].
+    ///
+    /// The protocol limits the total number of streams during the lifetime of a connection
+    /// to 2**62, this limit applies to the sum of uni- and bi-directional streams. For most
+    /// practical purposes this is essentially unlimited.
+    ///
+    /// [`QuicTransportConfigBuilder::max_concurrent_uni_streams`]: super::QuicTransportConfigBuilder::max_concurrent_uni_streams
+    /// [`QuicTransportConfigBuilder::max_concurrent_bidi_streams`]: super::QuicTransportConfigBuilder::max_concurrent_bidi_streams
+    /// [`QuicTransportConfigBuilder::stream_receive_window`]: super::QuicTransportConfigBuilder::stream_receive_window
+    /// [`QuicTransportConfigBuilder::receive_window`]: super::QuicTransportConfigBuilder::receive_window
+    /// [`SendStream::set_priority`]: super::SendStream::set_priority
+    /// [`RecvStream`]: super::RecvStream
     #[inline]
     pub fn open_uni(&self) -> OpenUni<'_> {
         self.inner.open_uni()
@@ -821,35 +877,26 @@ impl<T: ConnectionState> Connection<T> {
 
     /// Initiates a new outgoing bidirectional stream.
     ///
-    /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
-    /// consequence, the peer won't be notified that a stream has been opened until the
-    /// stream is actually used. Calling [`open_bi`] then waiting on the [`RecvStream`]
-    /// without writing anything to [`SendStream`] will never succeed.
+    /// Bidirectional streams allows both peers to send as well as receive data. They act as
+    /// a pair of related unidirectional streams.
     ///
-    /// [`open_bi`]: Connection::open_bi
-    /// [`SendStream`]: crate::endpoint::SendStream
-    /// [`RecvStream`]: crate::endpoint::RecvStream
+    /// See [`Self::open_uni`] for a detailed description of how streams work.
     #[inline]
     pub fn open_bi(&self) -> OpenBi<'_> {
         self.inner.open_bi()
     }
 
     /// Accepts the next incoming uni-directional stream.
+    ///
+    /// See [`Self::open_uni`] for a detailed description of how streams work.
     #[inline]
     pub fn accept_uni(&self) -> AcceptUni<'_> {
         self.inner.accept_uni()
     }
 
-    /// Accept the next incoming bidirectional stream.
+    /// Accepts the next incoming bidirectional stream.
     ///
-    /// **Important Note**: The peer that calls [`open_bi`] must write to its [`SendStream`]
-    /// before the peer `Connection` is able to accept the stream using
-    /// `accept_bi()`. Calling [`open_bi`] then waiting on the [`RecvStream`] without
-    /// writing anything to the connected [`SendStream`] will never succeed.
-    ///
-    /// [`open_bi`]: Connection::open_bi
-    /// [`SendStream`]: crate::endpoint::SendStream
-    /// [`RecvStream`]: crate::endpoint::RecvStream
+    /// See [`Self::open_uni`] for a detailed description of how streams work.
     #[inline]
     pub fn accept_bi(&self) -> AcceptBi<'_> {
         self.inner.accept_bi()
@@ -861,7 +908,7 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.read_datagram()
     }
 
-    /// Wait for the connection to be closed for any reason.
+    /// Waits for the connection to be closed for any reason.
     ///
     /// Despite the return type's name, closed connections are often not an error condition
     /// at the application layer. Cases that might be routine include
@@ -1043,7 +1090,11 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.set_max_concurrent_uni_streams(count)
     }
 
-    /// See [`noq_proto::TransportConfig::receive_window`].
+    /// Sets the connection-level flow control receive window.
+    ///
+    /// See [`QuicTransportConfigBuilder::receive_window`].
+    ///
+    /// [`QuicTransportConfigBuilder::receive_window`]: super::QuicTransportConfigBuilder::receive_window
     #[inline]
     pub fn set_receive_window(&self, receive_window: VarInt) {
         self.inner.set_receive_window(receive_window)
@@ -1188,10 +1239,10 @@ impl Connection<OutgoingZeroRtt> {
 
     /// Waits until the full handshake occurs and returns a [`ZeroRttStatus`].
     ///
-    /// If `ZeroRttStatus::Accepted` is returned, than any streams created before
+    /// If `ZeroRttStatus::Accepted` is returned, then any streams created before
     /// the handshake has completed can still be used.
     ///
-    /// If `ZeroRttStatus::Rejected` is returned, than any streams created before
+    /// If `ZeroRttStatus::Rejected` is returned, then any streams created before
     /// the handshake will error and any data sent should be re-sent on a
     /// new stream.
     ///
