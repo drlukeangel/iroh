@@ -1221,7 +1221,9 @@ pub(crate) struct TransportsSender {
 }
 
 impl TransportsSender {
-    #[instrument(name = "poll_send", skip(self, cx, transmit), fields(len = transmit.contents.len()))]
+    // per-datagram hot path: INFO here emitted ~2M spans per 2h census across the
+    // fleet (the #1 emitter by 4x) — debug-only, like every per-frame seam.
+    #[instrument(level = "debug", name = "poll_send", skip(self, cx, transmit), fields(len = transmit.contents.len()))]
     pub(crate) fn poll_send(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context,
