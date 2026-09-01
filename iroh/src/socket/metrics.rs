@@ -16,6 +16,8 @@ pub struct Metrics {
     pub send_ipv6: Counter,
     /// Number of bytes sent over the relay transport.
     pub send_relay: Counter,
+    /// Number of QUIC datagrams sent.
+    pub send_datagrams: Counter,
 
     /// Number of data bytes received over the relay transport.
     pub recv_data_relay: Counter,
