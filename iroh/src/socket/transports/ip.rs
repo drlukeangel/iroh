@@ -338,6 +338,16 @@ impl IpSender {
 
         match res {
             Poll::Ready(Ok(res)) => {
+                let datagram_count = if let Some(seg) = transmit.segment_size {
+                    if seg > 0 {
+                        total_bytes.div_ceil(seg as u64)
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                };
+                self.metrics.send_datagrams.inc_by(datagram_count);
                 match dst {
                     SocketAddr::V4(_) => {
                         self.metrics.send_ipv4.inc_by(total_bytes);

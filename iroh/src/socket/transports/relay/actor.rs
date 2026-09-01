@@ -668,6 +668,7 @@ impl ActiveRelayActor {
                     // TODO(frando): can we avoid the clone here?
                     let metrics = self.metrics.clone();
                     let packet_iter = send_datagrams_buf.drain(..).map(|item| {
+                        metrics.send_datagrams.inc();
                         metrics.send_relay.inc_by(item.datagrams.contents.len() as _);
                         Ok(ClientToRelayMsg::Datagrams {
                             dst_endpoint_id: item.remote_endpoint,
