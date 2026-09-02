@@ -1450,6 +1450,11 @@ impl Endpoint {
             .collect()
     }
 
+    /// Returns the achieved (recv_buffer_size, send_buffer_size) of the primary transport socket.
+    pub fn socket_buffer_sizes(&self) -> (usize, usize) {
+        self.inner.socket_buffer_sizes()
+    }
+
     // # Methods for less common getters.
     //
     // Partially they return things passed into the builder.

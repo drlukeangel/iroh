@@ -188,6 +188,10 @@ impl IpTransport {
         })
     }
 
+    pub(super) fn socket_buffer_sizes(&self) -> io::Result<(usize, usize)> {
+        self.socket.socket_buffer_sizes()
+    }
+
     /// NOTE: Receiving on a closed socket will return [`Poll::Pending`] indefinitely.
     pub(super) fn poll_recv(
         &mut self,
@@ -421,6 +425,14 @@ impl IpTransports {
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &IpTransport> {
         self.v4.iter().chain(self.v6.iter())
+    }
+
+    pub(super) fn socket_buffer_sizes(&self) -> (usize, usize) {
+        if let Some(t) = self.v4.first().or_else(|| self.v6.first()) {
+            t.socket_buffer_sizes().unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        }
     }
 
     pub(super) fn bind(

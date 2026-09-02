@@ -478,6 +478,16 @@ impl Transports {
         })
     }
 
+    #[cfg(not(wasm_browser))]
+    pub(crate) fn socket_buffer_sizes(&self) -> (usize, usize) {
+        self.ip.socket_buffer_sizes()
+    }
+
+    #[cfg(wasm_browser)]
+    pub(crate) fn socket_buffer_sizes(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     /// Returns the bound addresses for IP based transports
     #[cfg(not(wasm_browser))]
     pub(crate) fn ip_bind_addrs(&self) -> Vec<SocketAddr> {

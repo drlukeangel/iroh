@@ -381,6 +381,7 @@ pub(crate) struct Socket {
     pub(crate) hooks: EndpointHooksList,
     /// Tracing span for this endpoint.
     pub(crate) span: Span,
+    pub(crate) socket_buffer_sizes: (usize, usize),
 }
 
 impl Socket {
@@ -395,6 +396,11 @@ impl Socket {
                 None
             }
         })
+    }
+
+    /// Returns the achieved (recv_buffer_size, send_buffer_size) of the primary transport socket.
+    pub(crate) fn socket_buffer_sizes(&self) -> (usize, usize) {
+        self.socket_buffer_sizes
     }
 
     /// Whether the iroh endpoint is closed and all its actors stopped.
@@ -1008,6 +1014,7 @@ impl EndpointInner {
             tls_config: tls_config.clone(),
             hooks,
             span: span.clone(),
+            socket_buffer_sizes: transports.socket_buffer_sizes(),
         });
 
         let mut endpoint_config =
