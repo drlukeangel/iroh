@@ -196,6 +196,9 @@ pub(crate) struct Options {
 
     /// Explicitly configured external addresses to advertise.
     pub(crate) configured_addrs: BTreeSet<SocketAddr>,
+
+    /// Maximum UDP payload size accepted from peers.
+    pub(crate) max_udp_payload_size: Option<u16>,
 }
 
 /// Inner state for an iroh [`crate::Endpoint`].
@@ -382,6 +385,7 @@ pub(crate) struct Socket {
     /// Tracing span for this endpoint.
     pub(crate) span: Span,
     pub(crate) socket_buffer_sizes: (usize, usize),
+    pub(crate) max_udp_payload_size: u16,
 }
 
 impl Socket {
@@ -401,6 +405,11 @@ impl Socket {
     /// Returns the achieved (recv_buffer_size, send_buffer_size) of the primary transport socket.
     pub(crate) fn socket_buffer_sizes(&self) -> (usize, usize) {
         self.socket_buffer_sizes
+    }
+
+    /// Returns the configured maximum UDP payload size in bytes.
+    pub(crate) fn max_udp_payload_size(&self) -> u16 {
+        self.max_udp_payload_size
     }
 
     /// Whether the iroh endpoint is closed and all its actors stopped.
@@ -899,6 +908,7 @@ impl EndpointInner {
             net_report_config,
             static_config,
             configured_addrs,
+            max_udp_payload_size,
         } = opts;
 
         let address_lookup = address_lookup::AddressLookupServices::default();
@@ -1015,6 +1025,7 @@ impl EndpointInner {
             hooks,
             span: span.clone(),
             socket_buffer_sizes: transports.socket_buffer_sizes(),
+            max_udp_payload_size: max_udp_payload_size.unwrap_or(1472),
         });
 
         let mut endpoint_config =
@@ -1025,6 +1036,11 @@ impl EndpointInner {
         // through to noq. We set the first byte of the packet to zero, which makes noq ignore
         // the packet if grease_quic_bit is set to false.
         endpoint_config.grease_quic_bit(false);
+        if let Some(size) = max_udp_payload_size {
+            endpoint_config
+                .max_udp_payload_size(size)
+                .map_err(|err| e!(BindError::CreateQuicEndpoint, io::Error::new(io::ErrorKind::InvalidInput, err.to_string())))?;
+        }
 
         let local_addrs_watch = transports.local_addrs_watch();
         let transports_network_change = transports.create_network_change_sender();
@@ -1128,6 +1144,11 @@ impl EndpointInner {
     /// Returns a reference to the underlying [`noq::Endpoint`].
     pub(crate) fn noq_endpoint(&self) -> &noq::Endpoint {
         &self.endpoint
+    }
+
+    /// Returns the configured maximum UDP payload size in bytes.
+    pub(crate) fn max_udp_payload_size(&self) -> u16 {
+        self.sock.max_udp_payload_size()
     }
 
     /// Closes the iroh endpoint.
@@ -2192,6 +2213,7 @@ mod tests {
             net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
+            max_udp_payload_size: None,
         }
     }
 
@@ -2608,6 +2630,7 @@ mod tests {
             net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
+            max_udp_payload_size: None,
         };
         let sock = EndpointInner::bind(opts).await?;
         Ok(sock)

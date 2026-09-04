@@ -148,6 +148,7 @@ pub struct Builder {
     net_report_config: NetReportConfig,
     crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
     configured_addrs: BTreeSet<SocketAddr>,
+    max_udp_payload_size: Option<u16>,
 }
 
 impl From<RelayMode> for Option<TransportConfig> {
@@ -216,6 +217,7 @@ impl Builder {
             net_report_config: Default::default(),
             crypto_provider: None,
             configured_addrs: Default::default(),
+            max_udp_payload_size: None,
         }
     }
 
@@ -279,6 +281,7 @@ impl Builder {
             net_report_config: self.net_report_config,
             static_config,
             configured_addrs: self.configured_addrs,
+            max_udp_payload_size: self.max_udp_payload_size,
         };
 
         let inner = socket::EndpointInner::bind(sock_opts)
@@ -668,6 +671,14 @@ impl Builder {
     /// and maintaining direct connections.
     pub fn transport_config(mut self, transport_config: QuicTransportConfig) -> Self {
         self.transport_config = transport_config;
+        self
+    }
+
+    /// Sets the maximum UDP payload size in bytes accepted from peers.
+    ///
+    /// Must be greater than or equal to 1200. Defaults to 1472 bytes.
+    pub fn max_udp_payload_size(mut self, size: u16) -> Self {
+        self.max_udp_payload_size = Some(size);
         self
     }
 
@@ -1455,6 +1466,11 @@ impl Endpoint {
         self.inner.socket_buffer_sizes()
     }
 
+    /// Returns the configured maximum UDP payload size in bytes.
+    pub fn max_udp_payload_size(&self) -> u16 {
+        self.inner.max_udp_payload_size()
+    }
+
     // # Methods for less common getters.
     //
     // Partially they return things passed into the builder.
@@ -2039,6 +2055,27 @@ mod tests {
     };
 
     const TEST_ALPN: &[u8] = b"n0/iroh/test";
+
+    #[tokio::test]
+    async fn test_max_udp_payload_size_builder() {
+        let default_ep = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        assert_eq!(default_ep.max_udp_payload_size(), 1472);
+
+        let jumbo_ep = Endpoint::builder(presets::Minimal)
+            .max_udp_payload_size(8972)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        assert_eq!(jumbo_ep.max_udp_payload_size(), 8972);
+
+        default_ep.close().await;
+        jumbo_ep.close().await;
+    }
 
     #[tokio::test]
     #[traced_test]
