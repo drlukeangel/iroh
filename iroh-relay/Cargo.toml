@@ -13,7 +13,17 @@ rust-version = "1.91"
 [lib]
 # We need "cdylib" to actually generate .wasm files when we run with --target=wasm32-unknown-unknown.
 # It would be nice if we could make this target-dependent, but we can't (yet): https://github.com/rust-lang/cargo/issues/12260
-crate-type = ["lib", "cdylib"]
+# RAFKA LOCAL DIVERGENCE (2026-09-05, Luke ruling) — DROP THIS WHEN RETURNING TO UPSTREAM.
+# Upstream declares `crate-type = ["lib", "cdylib"]` so that `--target wasm32-unknown-unknown`
+# emits .wasm files (cargo cannot make crate-type target-dependent: rust-lang/cargo#12260).
+# rafka never builds wasm32 and never loads the cdylib: every consumer links the rlib half
+# statically (ldd of every node binary: 0 iroh shared objects; nm: the symbols are inside).
+# The cdylib half costs a full dynamic link per build AND makes sccache refuse the compile
+# ("Non-cacheable reasons: crate-type"), so this crate was compiled from scratch on every
+# cold build (~12 s for iroh alone, measured twice on 2026-09-05). Removing it changes no
+# symbol, API or runtime behaviour. Restore the upstream line to build for wasm32 again.
+# upstream: crate-type = ["lib", "cdylib"]
+crate-type = ["lib"]
 
 [lints]
 workspace = true
