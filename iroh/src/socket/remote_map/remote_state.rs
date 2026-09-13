@@ -327,23 +327,23 @@ impl RemoteStateActor {
                                 RemoteStateMessage::RemoteInfo(_) => "RemoteInfo",
                                 RemoteStateMessage::NetworkChange { .. } => "NetworkChange",
                             };
-                            eprintln!("[flow-bracket] RUN_LOOP_RECV_WOKE variant={vname}");
+                            trace!("[flow-bracket] RUN_LOOP_RECV_WOKE variant={vname}");
                             self.handle_message(msg).await;
                         }
                         None => break,
                     }
                 }
                 Some((id, evt)) = self.state.path_events_rx.recv() => {
-                    eprintln!("[flow-bracket] SELECT_ARM path_events id={id:?} evt={evt:?}");
+                    trace!("[flow-bracket] SELECT_ARM path_events id={id:?} evt={evt:?}");
                     self.handle_path_event(id, evt);
                 }
                 Some((id, evt)) = self.state.addr_events_rx.recv() => {
-                    eprintln!("[flow-bracket] SELECT_ARM addr_events id={id:?}");
+                    trace!("[flow-bracket] SELECT_ARM addr_events id={id:?}");
                     trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
                     self.trigger_holepunching();
                 }
                 Some((conn_id, closed)) = self.state.connections_close_rx.recv() => {
-                    eprintln!("[flow-bracket] SELECT_ARM connections_close conn_id={conn_id:?}");
+                    trace!("[flow-bracket] SELECT_ARM connections_close conn_id={conn_id:?}");
                     self.handle_connection_close(conn_id, closed);
                 }
                 res = self.state.local_direct_addrs.updated() => {
@@ -416,13 +416,13 @@ impl RemoteStateActor {
             RemoteStateMessage::RemoteInfo(_) => "RemoteInfo",
             RemoteStateMessage::NetworkChange { .. } => "NetworkChange",
         };
-        eprintln!("[flow-bracket] handle_message ENTER variant={variant}");
+        trace!("[flow-bracket] handle_message ENTER variant={variant}");
 
         match msg {
             RemoteStateMessage::SendDatagram(sender, transmit) => {
-                eprintln!("[flow-bracket] handle_message PRE_AWAIT variant=SendDatagram");
+                trace!("[flow-bracket] handle_message PRE_AWAIT variant=SendDatagram");
                 self.state.handle_msg_send_datagram(sender, transmit).await;
-                eprintln!("[flow-bracket] handle_message POST_AWAIT variant=SendDatagram");
+                trace!("[flow-bracket] handle_message POST_AWAIT variant=SendDatagram");
             }
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
@@ -443,7 +443,7 @@ impl RemoteStateActor {
             }
         }
 
-        eprintln!("[flow-bracket] handle_message EXIT variant={variant}");
+        trace!("[flow-bracket] handle_message EXIT variant={variant}");
     }
 
     /// Handles [`RemoteStateMessage::AddConnection`].
@@ -901,15 +901,15 @@ impl State {
             // know that it is the correct one.
             // See https://github.com/n0-computer/iroh/issues/4280.
             let four_tuple = transports::FourTuple::from_remote(addr.remote());
-            eprintln!("[flow-bracket] send_datagram PRE selected_path addr={addr:?}");
+            trace!("[flow-bracket] send_datagram PRE selected_path addr={addr:?}");
             let result = send_datagram(&mut sender, four_tuple, transmit).await;
-            eprintln!("[flow-bracket] send_datagram POST selected_path addr={addr:?} ok={}", result.is_ok());
+            trace!("[flow-bracket] send_datagram POST selected_path addr={addr:?} ok={}", result.is_ok());
             if let Err(err) = result {
                 debug!(?addr, "failed to send datagram on selected_path: {err:#}");
             }
         } else {
             let all_paths: Vec<_> = self.paths.addrs().collect();
-            eprintln!("[flow-bracket] send_datagram all_paths paths={all_paths:?}");
+            trace!("[flow-bracket] send_datagram all_paths paths={all_paths:?}");
             trace!(
                 paths = ?all_paths,
                 "sending datagram to all known paths",
@@ -934,20 +934,20 @@ impl State {
                 // know that it is the correct one.
                 // See https://github.com/n0-computer/iroh/issues/4280.
                 } else {
-                    eprintln!("[flow-bracket] send_datagram PRE loop addr={addr:?}");
+                    trace!("[flow-bracket] send_datagram PRE loop addr={addr:?}");
                     let result = send_datagram(
                         &mut sender,
                         transports::FourTuple::from_remote(addr.clone()),
                         transmit.clone(),
                     )
                     .await;
-                    eprintln!("[flow-bracket] send_datagram POST loop addr={addr:?} ok={}", result.is_ok());
+                    trace!("[flow-bracket] send_datagram POST loop addr={addr:?} ok={}", result.is_ok());
                     if let Err(err) = result {
                         debug!(?addr, "failed to send datagram: {err:#}");
                     }
                 }
             }
-            eprintln!("[flow-bracket] send_datagram loop_done");
+            trace!("[flow-bracket] send_datagram loop_done");
             // This message is received *before* a connection is added.  So we do
             // not yet have a connection to holepunch.  Instead we trigger
             // holepunching when AddConnection is received.
