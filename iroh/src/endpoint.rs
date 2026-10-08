@@ -1669,6 +1669,26 @@ impl Endpoint {
         self.inner.remote_info(endpoint_id).await
     }
 
+    /// Authoritatively replaces the direct addresses `endpoint_id` is at.
+    ///
+    /// Every direct path to an address not in `addrs` is retired, open paths included; a
+    /// connection whose last open path it was is closed. Connections bound to a superseded
+    /// address cannot carry the next dial, and no datagram is sent to one. Relay addresses are
+    /// untouched. Returns once the retirement is done, so a [`Endpoint::connect`] that follows
+    /// sees only `addrs`.
+    pub async fn replace_direct_addrs(
+        &self,
+        endpoint_id: EndpointId,
+        addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+    ) {
+        if self.is_closed() {
+            return;
+        }
+        self.inner
+            .replace_direct_addrs(endpoint_id, addrs.into_iter().collect())
+            .await
+    }
+
     // # Methods for less common state updates.
 
     /// Notifies the system of potential network changes.

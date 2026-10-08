@@ -1372,6 +1372,24 @@ impl EndpointInner {
         rx.await.ok()
     }
 
+    /// Authoritatively replaces the direct addresses of `id`: every direct path to an address
+    /// not in `addrs` is retired, open paths included.
+    ///
+    /// Does nothing when no actor runs for `id` (nothing is known of it, so nothing is stale).
+    pub(crate) async fn replace_direct_addrs(&self, id: EndpointId, addrs: BTreeSet<SocketAddr>) {
+        let (tx, rx) = oneshot::channel();
+        let Some(sender) = self.remote_actors.get(&id) else {
+            return;
+        };
+        if sender
+            .send(RemoteStateMessage::ReplaceDirectAddrs(addrs, tx))
+            .await
+            .is_ok()
+        {
+            rx.await.ok();
+        }
+    }
+
     /// Registers the connection in the `RemoteStateActor`.
     ///
     /// The actor is responsible for holepunching and opening additional paths to this

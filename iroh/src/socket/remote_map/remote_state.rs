@@ -414,6 +414,10 @@ impl RemoteStateActor {
             RemoteStateMessage::ResolveRemote(addrs, tx) => {
                 self.state.handle_msg_resolve_remote(addrs, tx);
             }
+            RemoteStateMessage::ReplaceDirectAddrs(addrs, tx) => {
+                self.handle_msg_replace_direct_addrs(addrs);
+                tx.send(()).ok();
+            }
             RemoteStateMessage::RemoteInfo(tx) => {
                 let addrs = self.state.paths.to_remote_addrs();
                 let info = RemoteInfo {
@@ -528,6 +532,73 @@ impl RemoteStateActor {
         self.trigger_holepunching();
         self.select_path();
         tx.send(path_state_receiver).ok();
+    }
+
+    /// Handles [`RemoteStateMessage::ReplaceDirectAddrs`].
+    ///
+    /// The application names the only direct addresses this remote is at. Every direct path to
+    /// any other address is retired: dropped from the potential paths (so no datagram is sent
+    /// there), closed on every connection that holds it, and, when it is a connection's last
+    /// open path, the connection is closed with it, so no stale connection can take part in
+    /// the next dial. A selected path that was retired is unselected.
+    fn handle_msg_replace_direct_addrs(&mut self, addrs: BTreeSet<SocketAddr>) {
+        let keep = |remote: &transports::Addr| match remote {
+            transports::Addr::Ip(sockaddr) => addrs.contains(sockaddr),
+            _ => true,
+        };
+        let removed = self.state.paths.retain_addrs(&keep);
+        let mut retired_conns = Vec::new();
+        for (conn_id, conn_state) in self.connections.iter_mut() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            let stale: Vec<PathId> = conn_state
+                .paths
+                .iter()
+                .filter(|(_, remote)| remote.is_ip() && !keep(&remote.remote()))
+                .map(|(path_id, _)| *path_id)
+                .collect();
+            let mut closed_conn = false;
+            for path_id in &stale {
+                let Some(path) = conn.path(*path_id) else {
+                    continue;
+                };
+                match path.close() {
+                    Ok(()) | Err(noq_proto::ClosePathError::ClosedPath) => {}
+                    Err(_) => {
+                        // The last open path (or multipath is not negotiated): the
+                        // connection cannot outlive it.
+                        if !closed_conn {
+                            closed_conn = true;
+                            retired_conns.push(*conn_id);
+                            conn.close(0u32.into(), b"address superseded");
+                        }
+                    }
+                }
+            }
+            // The retired paths leave the connection's path map now, not when noq reports them
+            // abandoned: until then a path selection would still see them, and would select the
+            // very path that was retired. A closed connection keeps no path at all.
+            let leaving: Vec<PathId> = if closed_conn {
+                conn_state.paths.keys().copied().collect()
+            } else {
+                stale
+            };
+            for path_id in leaving {
+                conn_state.remove_path(&path_id, &conn);
+            }
+        }
+        if let Some(selected) = self.state.selected_path.as_ref()
+            && selected.is_ip()
+            && !keep(&selected.remote())
+        {
+            self.state.selected_path = None;
+        }
+        debug!(?removed, ?retired_conns, "direct addresses replaced");
+        self.state
+            .paths
+            .insert_multiple(addrs.iter().map(|a| transports::Addr::from(*a)), Source::App);
+        self.select_path();
     }
 
     /// Handles [`RemoteStateMessage::NetworkChange`].
@@ -1291,6 +1362,12 @@ pub(crate) enum RemoteStateMessage {
         BTreeSet<TransportAddr>,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
     ),
+    /// The application authoritatively replaces the remote's direct addresses.
+    ///
+    /// Every direct (IP) path to an address not in the set is retired, open paths included,
+    /// and the set is added as potential paths. Replies once the retirement is done.
+    #[debug("ReplaceDirectAddrs(..)")]
+    ReplaceDirectAddrs(BTreeSet<SocketAddr>, oneshot::Sender<()>),
     /// Returns information about the remote.
     ///
     /// This currently only includes a list of all known transport addresses for the remote.

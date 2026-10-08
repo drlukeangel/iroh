@@ -125,6 +125,25 @@ impl RemotePathState {
         }
     }
 
+    /// Drops every path whose address `keep` refuses, whatever its status, and returns them.
+    pub(super) fn retain_addrs(
+        &mut self,
+        keep: &dyn Fn(&transports::Addr) -> bool,
+    ) -> Vec<transports::Addr> {
+        let mut removed = Vec::new();
+        self.paths.retain(|addr, state| {
+            let kept = keep(addr);
+            if !kept {
+                if matches!(state.status, PathStatus::Open) {
+                    self.metrics.transport_ip_paths_removed.inc();
+                }
+                removed.push(addr.clone());
+            }
+            kept
+        });
+        removed
+    }
+
     /// Inserts multiple addresses of unknown status into our list of potential paths.
     ///
     /// If this caused the path set to transition from empty to non-empty, any
