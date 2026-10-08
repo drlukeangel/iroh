@@ -47,13 +47,13 @@ iroh-relay = { version = "1.3.0", path = "../iroh-relay", default-features = fal
 n0-future = "0.3"
 n0-error = "1.0.0"
 n0-watcher = "1.0.0"
-netwatch = "0.19.3"
+netwatch = { version = "0.19.3", git = "https://github.com/drlukeangel/netwatch", rev = "3b29b5338d8d5cca09867537b58fc954353ec393" }
 papaya = { version = "0.2.3", default-features = false }
 pin-project = "1"
 portable-atomic = "1"
-noq = { version = "1.3.0", default-features = false, features = ["rustls"] }
-noq-proto = { version = "1.3.0", default-features = false }
-noq-udp = { version = "1.3.0", default-features = false }
+noq = { git = "https://github.com/drlukeangel/noq", rev = "d878a5ea83a7997c991967e1fe723bc4f059ead1", version = "1.3.0", default-features = false, features = ["rustls"] }
+noq-proto = { git = "https://github.com/drlukeangel/noq", rev = "d878a5ea83a7997c991967e1fe723bc4f059ead1", version = "1.3.0", default-features = false }
+noq-udp = { git = "https://github.com/drlukeangel/noq", rev = "d878a5ea83a7997c991967e1fe723bc4f059ead1", version = "1.3.0", default-features = false }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 rustc-hash = "2"
@@ -84,8 +84,8 @@ axum = { version = "0.8", optional = true }
 
 # non-wasm-in-browser dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-portmapper = { version = "0.19.3", optional = true, default-features = false }
-noq = { version = "1.3.0", default-features = false, features = ["runtime-tokio", "rustls"] }
+portmapper = { git = "https://github.com/drlukeangel/netwatch", rev = "3b29b5338d8d5cca09867537b58fc954353ec393", version = "0.19.3", optional = true, default-features = false }
+noq = { git = "https://github.com/drlukeangel/noq", rev = "d878a5ea83a7997c991967e1fe723bc4f059ead1", version = "1.3.0", default-features = false, features = ["runtime-tokio", "rustls"] }
 tokio = { version = "1", features = [
     "io-util",
     "macros",
