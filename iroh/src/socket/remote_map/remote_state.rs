@@ -12,7 +12,7 @@ use std::{
 use iroh_base::{EndpointId, TransportAddr};
 use n0_error::StackResultExt;
 use n0_future::{
-    FuturesUnorderedBounded, MaybeFuture, Stream, StreamExt,
+    FuturesUnordered, FuturesUnorderedBounded, MaybeFuture, Stream, StreamExt,
     boxed::BoxStream,
     future::{Boxed, now_or_never},
     task::JoinSet,
@@ -427,7 +427,6 @@ impl RemoteStateActor {
             }
         }
 
-        trace!("[flow-bracket] handle_message EXIT variant={variant}");
     }
 
     /// Handles [`RemoteStateMessage::AddConnection`].
