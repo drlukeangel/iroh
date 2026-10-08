@@ -227,8 +227,14 @@ impl Builder {
 
     /// Binds the endpoint.
     pub async fn bind(self) -> Result<Endpoint, BindError> {
-        let secret_key = self.secret_key.unwrap_or_else(SecretKey::generate);
+        let secret_key = self.secret_key.clone().unwrap_or_else(SecretKey::generate);
+        let span = info_span!("endpoint", id = %secret_key.public().fmt_short());
+        // The span instruments the future: a guard held across an await would leave the span
+        // entered on whichever worker the task last ran on.
+        self.bind_in_span(secret_key).instrument(span).await
+    }
 
+    async fn bind_in_span(self, secret_key: SecretKey) -> Result<Endpoint, BindError> {
         let crypto_provider = self
             .crypto_provider
             .ok_or_else(|| e!(BindError::InvalidCryptoProvider))?;
@@ -237,9 +243,6 @@ impl Builder {
             RustlsTokenKey::new(&mut rand::rng(), &crypto_provider)
                 .ok_or_else(|| e!(BindError::InvalidCryptoProvider))?,
         );
-
-        let span = info_span!("endpoint", id = %secret_key.public().fmt_short());
-        let _guard = span.enter();
 
         let tls_config = tls::TlsConfig::new(
             secret_key.clone(),
@@ -291,9 +294,7 @@ impl Builder {
             max_udp_payload_size: self.max_udp_payload_size,
         };
 
-        let inner = socket::EndpointInner::bind(sock_opts)
-            .instrument(Span::current())
-            .await?;
+        let inner = socket::EndpointInner::bind(sock_opts).await?;
         debug!(
             id = %inner.static_config.tls_config.secret_key.public(),
             iroh_version = %env!("CARGO_PKG_VERSION"),
