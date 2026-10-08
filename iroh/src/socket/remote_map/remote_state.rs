@@ -327,16 +327,16 @@ impl RemoteStateActor {
                     }
                 }
                 Some((id, evt)) = self.state.path_events_rx.recv() => {
-                    eprintln!("[flow-bracket] SELECT_ARM path_events id={id:?} evt={evt:?}");
+                    trace!("[flow-bracket] SELECT_ARM path_events id={id:?} evt={evt:?}");
                     self.handle_path_event(id, evt);
                 }
                 Some((id, evt)) = self.state.addr_events_rx.recv() => {
-                    eprintln!("[flow-bracket] SELECT_ARM addr_events id={id:?}");
+                    trace!("[flow-bracket] SELECT_ARM addr_events id={id:?}");
                     trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
                     self.trigger_holepunching();
                 }
                 Some((conn_id, closed)) = self.state.connections_close_rx.recv() => {
-                    eprintln!("[flow-bracket] SELECT_ARM connections_close conn_id={conn_id:?}");
+                    trace!("[flow-bracket] SELECT_ARM connections_close conn_id={conn_id:?}");
                     self.handle_connection_close(conn_id, closed);
                 }
                 res = self.state.local_direct_addrs.updated() => {
@@ -427,7 +427,7 @@ impl RemoteStateActor {
             }
         }
 
-        eprintln!("[flow-bracket] handle_message EXIT variant={variant}");
+        trace!("[flow-bracket] handle_message EXIT variant={variant}");
     }
 
     /// Handles [`RemoteStateMessage::AddConnection`].
@@ -891,7 +891,7 @@ impl State {
             smallvec![transports::FourTuple::from_remote(addr.remote())]
         } else {
             let all_paths: Vec<_> = self.paths.addrs().collect();
-            eprintln!("[flow-bracket] send_datagram all_paths paths={all_paths:?}");
+            trace!("[flow-bracket] send_datagram all_paths paths={all_paths:?}");
             trace!(
                 paths = ?all_paths,
                 "sending datagram to all known paths",
@@ -920,7 +920,7 @@ impl State {
                     targets.push(transports::FourTuple::from_remote(addr.clone()));
                 }
             }
-            eprintln!("[flow-bracket] send_datagram loop_done");
+            trace!("[flow-bracket] send_datagram loop_done");
             // This message is received *before* a connection is added.  So we do
             // not yet have a connection to holepunch.  Instead we trigger
             // holepunching when AddConnection is received.
