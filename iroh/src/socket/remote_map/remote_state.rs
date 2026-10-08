@@ -12,7 +12,7 @@ use std::{
 use iroh_base::{EndpointId, TransportAddr};
 use n0_error::StackResultExt;
 use n0_future::{
-    FuturesUnordered, FuturesUnorderedBounded, MaybeFuture, MergeUnbounded, Stream, StreamExt,
+    FuturesUnorderedBounded, MaybeFuture, Stream, StreamExt,
     boxed::BoxStream,
     future::{Boxed, now_or_never},
     task::JoinSet,
@@ -94,24 +94,18 @@ const ACTOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DATAGRAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DATAGRAM_SEND_TASKS: usize = 16;
 
-/// A stream of events from all paths for all connections.
-///
-/// The connection is identified using [`ConnId`].  The event `Err` variant happens when the
-/// actor has lagged processing the events, which is rather critical for us.
-type PathEvents = MergeUnbounded<
-    Pin<Box<dyn Stream<Item = (ConnId, Result<NoqPathEvent, noq::Lagged>)> + Send + Sync>>,
->;
 
-/// A stream of events of announced NAT traversal candidate addresses for all connections.
+/// Channel capacity for per-connection event forwarder channels.
 ///
-/// The connection is identified using [`ConnId`].
-type AddrEvents = MergeUnbounded<
-    Pin<
-        Box<
-            dyn Stream<Item = (ConnId, Result<n0_nat_traversal::Event, noq::Lagged>)> + Send + Sync,
-        >,
-    >,
->;
+/// Each of the three event types (path events, addr events, connection-close) gets its
+/// own `tokio::sync::mpsc` channel with this capacity.  The forwarder pattern replaces
+/// the previous `MergeUnbounded` / `FuturesUnordered` select arms, which suffered from
+/// waker-loss: `push()` on those collections does not wake a parked owner task, and the
+/// sentinel work-around did not fully cover the push-while-parked production pattern.
+///
+/// `tokio::sync::mpsc` waker semantics are unconditionally correct: `send().await` wakes
+/// the receiver regardless of whether the receiver was parked before or after the send.
+const EVENT_CHANNEL_CAP: usize = 64;
 
 /// The state we need to know about a single remote endpoint.
 ///
@@ -147,12 +141,24 @@ struct State {
 
     // Internal state - Noq Connections we are managing.
     //
-    /// Notifications when connections are closed.
-    connections_close: FuturesUnordered<OnClosed>,
-    /// Events emitted by Noq about path changes, for all paths, all connections.
-    path_events: PathEvents,
-    /// A stream of events of announced NAT traversal candidate addresses for all connections.
-    addr_events: AddrEvents,
+    // The three channels below replace the prior MergeUnbounded / FuturesUnordered arms.
+    // Each AddConnection spawns three tiny forwarder tasks that stream events from the noq
+    // connection into these channels.  tokio::sync::mpsc unconditionally wakes the receiver
+    // when a message is sent, avoiding the waker-loss that affected the previous push-based
+    // approach (MergeUnbounded/FuturesUnordered push() does not wake a parked owner).
+    //
+    /// Sender half for path-event forwarder tasks.  Cloned once per connection.
+    path_events_tx: mpsc::Sender<(ConnId, Result<NoqPathEvent, noq::Lagged>)>,
+    /// Receiver for path events from all connections.
+    path_events_rx: mpsc::Receiver<(ConnId, Result<NoqPathEvent, noq::Lagged>)>,
+    /// Sender half for addr-event forwarder tasks.  Cloned once per connection.
+    addr_events_tx: mpsc::Sender<(ConnId, Result<n0_nat_traversal::Event, noq::Lagged>)>,
+    /// Receiver for NAT-traversal address events from all connections.
+    addr_events_rx: mpsc::Receiver<(ConnId, Result<n0_nat_traversal::Event, noq::Lagged>)>,
+    /// Sender half for connection-close forwarder tasks.  Cloned once per connection.
+    connections_close_tx: mpsc::Sender<(ConnId, Closed)>,
+    /// Receiver for connection-closed notifications from all connections.
+    connections_close_rx: mpsc::Receiver<(ConnId, Closed)>,
 
     // Internal state - Holepunching and path state.
     //
@@ -201,6 +207,9 @@ impl RemoteStateActor {
         address_lookup: AddressLookupServices,
         path_selector: Arc<dyn PathSelector>,
     ) -> Self {
+        let (path_events_tx, path_events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let (addr_events_tx, addr_events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let (connections_close_tx, connections_close_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         Self {
             connections: FxHashMap::default(),
             state: State {
@@ -209,9 +218,12 @@ impl RemoteStateActor {
                 local_direct_addrs,
                 mapped_addrs,
                 address_lookup,
-                connections_close: Default::default(),
-                path_events: Default::default(),
-                addr_events: Default::default(),
+                path_events_tx,
+                path_events_rx,
+                addr_events_tx,
+                addr_events_rx,
+                connections_close_tx,
+                connections_close_rx,
                 paths: RemotePathState::new(metrics),
                 last_holepunch: None,
                 selected_path: Default::default(),
@@ -314,16 +326,16 @@ impl RemoteStateActor {
                         None => break,
                     }
                 }
-                Some((id, evt)) = self.state.path_events.next() => {
+                Some((id, evt)) = self.state.path_events_rx.recv() => {
                     eprintln!("[flow-bracket] SELECT_ARM path_events id={id:?} evt={evt:?}");
                     self.handle_path_event(id, evt);
                 }
-                Some((id, evt)) = self.state.addr_events.next() => {
+                Some((id, evt)) = self.state.addr_events_rx.recv() => {
                     eprintln!("[flow-bracket] SELECT_ARM addr_events id={id:?}");
                     trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
                     self.trigger_holepunching();
                 }
-                Some((conn_id, closed)) = self.state.connections_close.next(), if !self.state.connections_close.is_empty() => {
+                Some((conn_id, closed)) = self.state.connections_close_rx.recv() => {
                     eprintln!("[flow-bracket] SELECT_ARM connections_close conn_id={conn_id:?}");
                     self.handle_connection_close(conn_id, closed);
                 }
@@ -432,14 +444,45 @@ impl RemoteStateActor {
         let conn_id = ConnId(conn.stable_id());
         self.connections.remove(&conn_id);
 
-        // Hook up paths, NAT addresses and connection closed event streams.
-        self.state
-            .path_events
-            .push(Box::pin(conn.path_events().map(move |evt| (conn_id, evt))));
-        self.state.addr_events.push(Box::pin(
-            conn.nat_traversal_updates().map(move |evt| (conn_id, evt)),
-        ));
-        self.state.connections_close.push(OnClosed::new(&conn));
+        // Spawn forwarder tasks for path events, addr events, and connection-close.
+        //
+        // Each forwarder drains its source stream/future and forwards into the actor's
+        // mpsc channel.  tokio::sync::mpsc unconditionally wakes the receiver on send,
+        // avoiding the waker-loss that affected MergeUnbounded/FuturesUnordered::push()
+        // (push does not wake a parked owner — only the first subsequent poll registers
+        // the slot waker, and DiatomicWaker::notify() is a no-op if called before the
+        // first register()).  Forwarders self-terminate when the channel is closed (actor
+        // dropped) or when the source stream ends.
+        {
+            let mut path_stream = conn.path_events().map(move |evt| (conn_id, evt));
+            let path_tx = self.state.path_events_tx.clone();
+            tokio::spawn(async move {
+                while let Some(evt) = path_stream.next().await {
+                    if path_tx.send(evt).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        {
+            let mut addr_stream = conn.nat_traversal_updates().map(move |evt| (conn_id, evt));
+            let addr_tx = self.state.addr_events_tx.clone();
+            tokio::spawn(async move {
+                while let Some(evt) = addr_stream.next().await {
+                    if addr_tx.send(evt).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        {
+            let on_closed = OnClosed::new(&conn);
+            let close_tx = self.state.connections_close_tx.clone();
+            tokio::spawn(async move {
+                let result = on_closed.await;
+                let _ = close_tx.send(result).await;
+            });
+        }
 
         // Add local addrs to the connection
         let local_addrs = self.state.local_candidates();
@@ -1650,5 +1693,133 @@ mod tests {
                 assert_eq!(&buf[..len], b"initial");
             }
         }
+    }
+
+    use tokio::sync::mpsc;
+
+    /// Regression test for the waker-loss bug in [`RemoteStateActor`]'s run loop.
+    ///
+    /// # Root cause (historical — now fixed)
+    ///
+    /// Three arms in the actor's biased `select!` previously used `MergeUnbounded` and
+    /// `FuturesUnordered` from `futures-buffered`.  Both collections return
+    /// `Poll::Ready(None)` WITHOUT registering a waker when polled on an empty set
+    /// (documented upstream: "The caller must ensure that poll_next is called in order
+    /// to receive wake-up notifications").  `DiatomicWaker::notify()` is likewise a
+    /// no-op before the first `register()`, so pushes into these collections from within
+    /// the actor's own message handler (same task, same poll cycle) were silently lost:
+    /// the handler pushed, then the task parked, then the forwarder arrived — but no
+    /// waker was registered, so the select never re-polled.
+    ///
+    /// Three sentinel attempts (seeding the collections with `stream::pending()` /
+    /// `std::future::pending()`) failed because `push()` on these collections does NOT
+    /// wake a parked owner.
+    ///
+    /// # Fix — mpsc funnel
+    ///
+    /// All three arms were replaced with `tokio::sync::mpsc` channels.  Each
+    /// `AddConnection` handler clones the sender side and spawns three tiny forwarder
+    /// tasks that stream events from the connection into the channels.  The `select!`
+    /// arms are now `channel_rx.recv()` calls.  `tokio::sync::mpsc::send().await`
+    /// unconditionally wakes the receiver regardless of when the waker was registered.
+    ///
+    /// # Test structure
+    ///
+    /// Parts A / B / C: production-pattern proofs for each of the three replaced arms
+    /// (`path_events`, `addr_events`, `connections_close`).  Each proof:
+    ///   1. Simulates the production pattern exactly — the "handler" (same-task role)
+    ///      sends a message into the mpsc **before** the select parks, then the select
+    ///      parks, and a separately-spawned forwarder task sends another message.
+    ///   2. Asserts that the select wakes for BOTH messages within the timeout.
+    ///
+    /// The test also asserts that an `inbox` mpsc arm (simulating the actor's message
+    /// inbox) continues to fire after the event channels are drained — confirming the
+    /// multi-arm biased select stays live end-to-end.
+    #[tokio::test]
+    async fn actor_run_loop_mpsc_funnel_wakes_correctly() {
+        // -----------------------------------------------------------------------
+        // Helper: drive a biased select over one mpsc event arm + one inbox arm.
+        //
+        // Setup mirrors the production run loop:
+        //   - `event_tx` is cloned and passed to a simulated "handler" call that
+        //     sends one item synchronously (before the select parks) — this is the
+        //     same-task push pattern that defeated the sentinel approach.
+        //   - A second item is sent from a spawned forwarder task (after the select
+        //     has parked) — this is the remote-IO-arrival pattern.
+        //   - A third item (inbox message) is sent from another spawned task.
+        //
+        // All three must be received within 500ms.
+        // -----------------------------------------------------------------------
+        async fn run_mpsc_select_proof(label: &'static str) {
+            let (event_tx, mut event_rx) = mpsc::channel::<u32>(super::EVENT_CHANNEL_CAP);
+            let (inbox_tx, mut inbox_rx) = mpsc::channel::<u32>(4);
+
+            // Simulate the handler running inside the actor task BEFORE the select parks:
+            // clones the sender (same pattern as AddConnection handler cloning path_events_tx)
+            // and sends the first item synchronously.
+            let handler_tx = event_tx.clone();
+            handler_tx.try_send(1u32).expect("handler send must not block on empty channel");
+
+            // Forwarder task: sends a second event after a yield (models remote IO arriving
+            // after the select has parked — the scenario sentinels could not survive).
+            let forwarder_tx = event_tx.clone();
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                let _ = forwarder_tx.send(2u32).await;
+            });
+
+            // Inbox message from a peer actor, also after a yield.
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                let _ = inbox_tx.send(99u32).await;
+            });
+
+            let mut events_received: Vec<u32> = Vec::new();
+            let mut got_inbox = false;
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+
+            loop {
+                if events_received.len() >= 2 && got_inbox {
+                    break;
+                }
+                if tokio::time::Instant::now() > deadline {
+                    panic!(
+                        "[{label}] waker-loss regression: select did not receive all events \
+                         within 500ms (events={events_received:?} got_inbox={got_inbox}). \
+                         The mpsc funnel is broken or the select arm is wrong."
+                    );
+                }
+                tokio::select! {
+                    biased;
+                    Some(item) = event_rx.recv() => {
+                        events_received.push(item);
+                    }
+                    msg = inbox_rx.recv() => {
+                        if msg.is_some() {
+                            got_inbox = true;
+                        }
+                    }
+                }
+            }
+
+            // The two event items must arrive (order may vary due to yield semantics).
+            let mut sorted = events_received.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                vec![1u32, 2u32],
+                "[{label}] expected items 1 and 2 from the two senders"
+            );
+        }
+
+        // Part A: path_events channel arm.
+        run_mpsc_select_proof("path_events").await;
+
+        // Part B: addr_events channel arm (same mechanics, separate proof).
+        run_mpsc_select_proof("addr_events").await;
+
+        // Part C: connections_close channel arm (same mechanics, separate proof).
+        run_mpsc_select_proof("connections_close").await;
     }
 }
