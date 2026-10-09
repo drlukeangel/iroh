@@ -189,6 +189,8 @@ pub(crate) struct Options {
     pub(crate) hooks: EndpointHooksList,
     pub(crate) path_selector: Arc<dyn PathSelector>,
     pub(crate) portmapper_config: portmapper::PortmapperConfig,
+    /// Whether the socket watches the host's network interfaces.
+    pub(crate) network_monitor: bool,
     pub(crate) net_report_config: crate::net_report::NetReportConfig,
 
     /// Static configuration for the endpoint.
@@ -862,6 +864,10 @@ pub enum BindError {
     CreateNetmonMonitor { source: AnyError },
     #[error("Invalid transport configuration")]
     InvalidTransportConfig,
+    #[error(
+        "The network monitor is disabled and an IP transport is bound to the unspecified address {addr}: with no interface enumeration there is no address to publish for it, so a disabled monitor needs every IP transport bound to a specific address"
+    )]
+    NetworkMonitorOffUnspecifiedBind { addr: SocketAddr },
     #[error("Invalid CA root configuration")]
     InvalidCaRootConfig { source: io::Error },
     #[error("Failed to create an address lookup service")]
@@ -899,6 +905,7 @@ impl EndpointInner {
             hooks,
             path_selector,
             portmapper_config,
+            network_monitor: network_monitor_enabled,
             net_report_config,
             static_config,
             configured_addrs,
@@ -983,6 +990,18 @@ impl EndpointInner {
         #[cfg(not(wasm_browser))]
         let has_ip_transports = !transports.ip_bind_addrs().is_empty();
 
+        // A disabled network monitor leaves no interface list to expand an unspecified bind
+        // address with: refuse it by name here, before anything else is built on the transports.
+        #[cfg(not(wasm_browser))]
+        if !network_monitor_enabled
+            && let Some(addr) = transports
+                .ip_bind_addrs()
+                .into_iter()
+                .find(|addr| addr.ip().is_unspecified())
+        {
+            bail!(BindError::NetworkMonitorOffUnspecifiedBind { addr });
+        }
+
         let direct_addrs = DiscoveredDirectAddrs::default();
 
         let remote_map = {
@@ -1050,9 +1069,22 @@ impl EndpointInner {
         )
         .map_err(|err| e!(BindError::CreateQuicEndpoint, err))?;
 
-        let network_monitor = netmon::Monitor::new()
-            .await
-            .map_err(|err| e!(BindError::CreateNetmonMonitor, anyerr!(err)))?;
+        // With the monitor disabled no interface enumeration is started or awaited here: the
+        // socket holds no monitor and no interface state, and nothing synthesizes one.
+        let network_monitor = if network_monitor_enabled {
+            let monitor = netmon::Monitor::new()
+                .await
+                .map_err(|err| e!(BindError::CreateNetmonMonitor, anyerr!(err)))?;
+            let mut interfaces = monitor.interface_state();
+            let last_seen = interfaces.get();
+            Some(NetworkMonitor {
+                monitor,
+                interfaces,
+                last_seen,
+            })
+        } else {
+            None
+        };
 
         #[cfg(not(wasm_browser))]
         let net_report_config = {
@@ -1095,8 +1127,6 @@ impl EndpointInner {
             sock.shutdown.at_close_start.child_token(),
         );
 
-        let local_interfaces_watcher = network_monitor.interface_state();
-
         #[cfg_attr(not(wasm_browser), allow(unused_mut))]
         let mut actor = Actor {
             endpoint: endpoint.clone(),
@@ -1104,7 +1134,6 @@ impl EndpointInner {
             remote_map,
             periodic_re_stun_timer: new_re_stun_timer(false),
             network_monitor,
-            local_interfaces_watcher,
             direct_addr_update_state,
             transports_network_change,
             direct_addr_done_rx,
@@ -1504,12 +1533,9 @@ struct Actor {
     remote_map: RemoteMap,
     /// When set, is an AfterFunc timer that will call Socket::do_periodic_stun.
     periodic_re_stun_timer: time::Interval,
-    /// An actor watching the local network interfaces.
-    ///
-    /// The monitored changes are emitted via [`Self::local_interfaces_watcher`].
-    network_monitor: netmon::Monitor,
-    /// Watcher for changes to the local network interfaces, IP addresses and routes.
-    local_interfaces_watcher: n0_watcher::Direct<netmon::State>,
+    /// The actor watching the local network interfaces, when the endpoint was built with
+    /// a network monitor. `None` means the endpoint never enumerates the host's interfaces.
+    network_monitor: Option<NetworkMonitor>,
     transports_network_change: transports::NetworkChangeSender,
     /// Indicates the direct addr update state.
     direct_addr_update_state: DirectAddrUpdateState,
@@ -1523,6 +1549,17 @@ struct Actor {
     call_notify_quic_network_change: Option<PendingNetworkChangeNotify>,
 }
 
+/// The host's network interfaces as the socket watches them.
+#[derive(Debug)]
+struct NetworkMonitor {
+    /// An actor watching the local network interfaces.
+    monitor: netmon::Monitor,
+    /// Watcher for changes to the local network interfaces, IP addresses and routes.
+    interfaces: n0_watcher::Direct<netmon::State>,
+    /// The interface state the last link change was compared against.
+    last_seen: netmon::State,
+}
+
 impl Actor {
     async fn run(
         mut self,
@@ -1530,9 +1567,6 @@ impl Actor {
         shutdown_token: CancellationToken,
         mut local_addrs_watcher: impl Watcher<Value = Vec<transports::Addr>> + Send + Sync,
     ) {
-        // Setup network monitoring
-        let mut current_netmon_state = self.local_interfaces_watcher.get();
-
         let mut portmap_watcher = self
             .direct_addr_update_state
             .port_mapper
@@ -1611,8 +1645,8 @@ impl Actor {
                     match reason {
                         Some(()) => {
                             // check if a new run needs to be scheduled
-                            let state = self.local_interfaces_watcher.get();
-                            self.direct_addr_update_state.try_run(state.into());
+                            let if_state = self.if_state_details();
+                            self.direct_addr_update_state.try_run(if_state);
                         }
                         None => {
                             warn!("direct addr watcher died");
@@ -1637,26 +1671,40 @@ impl Actor {
                     debug!("external address updated: {new_external_address:?}");
                     self.re_stun(UpdateReason::PortmapUpdated);
                 },
-                state = self.local_interfaces_watcher.updated() => {
+                // Without a network monitor this arm never completes.
+                state = async {
+                    match self.network_monitor.as_mut() {
+                        Some(monitor) => monitor.interfaces.updated().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     let Ok(state) = state else {
                         trace!("tick: link change receiver closed");
                         self.sock.metrics.socket.actor_tick_other.inc();
                         continue;
                     };
-                    let is_major = state.is_major_change(&current_netmon_state);
+                    let Some(monitor) = self.network_monitor.as_mut() else {
+                        continue;
+                    };
+                    let is_major = state.is_major_change(&monitor.last_seen);
                     event!(
                         target: "iroh::_events::link_change",
                         Level::DEBUG,
                         ?state,
                         is_major
                     );
-                    current_netmon_state = state;
+                    monitor.last_seen = state;
                     self.sock.metrics.socket.actor_link_change.inc();
                     self.handle_network_change(is_major);
                 }
                 _remote_id = self.remote_map.cleanup() => {},
                 _ = &mut notify_quic_network_change => {
-                    let has_network = self.has_usable_network();
+                    let Some(has_network) = self.has_usable_network() else {
+                        // Only a link change sets a pending notification, and without a
+                        // network monitor there is none.
+                        self.call_notify_quic_network_change = None;
+                        continue;
+                    };
                     let Some(pending) = self.call_notify_quic_network_change.as_mut() else {
                         continue;
                     };
@@ -1683,16 +1731,37 @@ impl Actor {
     }
 
     /// Whether the local network has a default route and at least one IP address.
-    fn has_usable_network(&mut self) -> bool {
+    ///
+    /// `None` when the endpoint has no network monitor: nothing knows the host's default
+    /// route, and a successful bind says nothing about it.
+    fn has_usable_network(&mut self) -> Option<bool> {
         #[cfg(target_family = "wasm")]
         {
-            true
+            Some(true)
         }
         #[cfg(not(target_family = "wasm"))]
         {
-            let interfaces = self.local_interfaces_watcher.get();
-            interfaces.default_route_interface.is_some()
-                && (interfaces.have_v4 || interfaces.have_v6)
+            let interfaces = self.network_monitor.as_mut()?.interfaces.get();
+            Some(
+                interfaces.default_route_interface.is_some()
+                    && (interfaces.have_v4 || interfaces.have_v6),
+            )
+        }
+    }
+
+    /// The interface facts a net report needs: from the network monitor when there is one,
+    /// else from the addresses the bound IP transports report.
+    fn if_state_details(&mut self) -> IfStateDetails {
+        match &mut self.network_monitor {
+            Some(monitor) => monitor.interfaces.get().into(),
+            None => {
+                let mut details = IfStateDetails::default();
+                for addr in self.sock.ip_local_addrs() {
+                    details.have_v4 |= addr.is_ipv4();
+                    details.have_v6 |= addr.is_ipv6();
+                }
+                details
+            }
         }
     }
 
@@ -1702,6 +1771,11 @@ impl Actor {
     /// interfaces, assigned IP addresses and routes.
     fn handle_network_change(&mut self, is_major: bool) {
         debug!(is_major, "link change detected");
+
+        let Some(has_usable_network) = self.has_usable_network() else {
+            debug!("no network monitor: the link change is ignored");
+            return;
+        };
 
         if is_major {
             if let Err(err) = self.transports_network_change.rebind() {
@@ -1716,7 +1790,7 @@ impl Actor {
             self.re_stun(UpdateReason::LinkChangeMinor);
         }
 
-        if self.has_usable_network() {
+        if has_usable_network {
             // This is considered a usable network change, propagate it to the QUIC stack
             // right away.
             self.call_notify_quic_network_change = None;
@@ -1785,7 +1859,12 @@ impl Actor {
         let hint = Hint {
             #[cfg(not(wasm_browser))]
             local_addrs: {
-                let interfaces = self.local_interfaces_watcher.get();
+                let Some(monitor) = self.network_monitor.as_mut() else {
+                    // Only a link change notifies the QUIC stack, and without a network
+                    // monitor there is none.
+                    return;
+                };
+                let interfaces = monitor.interfaces.get();
                 interfaces
                     .local_addresses
                     .regular
@@ -1807,9 +1886,8 @@ impl Actor {
     }
 
     fn re_stun(&mut self, why: UpdateReason) {
-        let state = self.local_interfaces_watcher.get();
-        self.direct_addr_update_state
-            .schedule_run(why, state.into());
+        let if_state = self.if_state_details();
+        self.direct_addr_update_state.schedule_run(why, if_state);
     }
 
     /// Processes an incoming actor message.
@@ -1818,7 +1896,9 @@ impl Actor {
     async fn handle_actor_message(&mut self, msg: ActorMessage) {
         match msg {
             ActorMessage::NetworkChange => {
-                self.network_monitor.network_change().await.ok();
+                if let Some(monitor) = &self.network_monitor {
+                    monitor.monitor.network_change().await.ok();
+                }
             }
             ActorMessage::RelayMapChange => {
                 self.handle_relay_map_change();
@@ -1937,7 +2017,12 @@ impl Actor {
         &mut self,
         addrs: &mut BTreeMap<SocketAddr, (DirectAddrType, Option<Ipv6AddrFlags>)>,
     ) {
-        let netmon_state = self.local_interfaces_watcher.get();
+        // Without a network monitor there is no interface state: an IPv6 address has no known
+        // flags, and an unspecified bind (refused at bind) has no interface addresses to expand to.
+        let netmon_state = self
+            .network_monitor
+            .as_mut()
+            .map(|monitor| monitor.interfaces.get());
 
         // Matches the addresses that have been bound vs the requested ones.
         let local_addrs: Vec<(SocketAddr, SocketAddr)> = self
@@ -1967,14 +2052,15 @@ impl Actor {
 
         // If a socket is bound to the unspecified address, create SocketAddrs for
         // each local IP address by pairing it with the port the socket is bound on.
-        if local_addrs
-            .iter()
-            .any(|(_, local)| local.ip().is_unspecified())
-        {
+        if let Some(netmon_state) = netmon_state.as_ref().filter(|_| {
+            local_addrs
+                .iter()
+                .any(|(_, local)| local.ip().is_unspecified())
+        }) {
             let LocalAddresses {
                 regular: mut ips,
                 loopback,
-            } = self.local_interfaces_watcher.get().local_addresses;
+            } = netmon_state.local_addresses.clone();
             if ips.is_empty() && addrs.is_empty() {
                 // Include loopback addresses only if there are no other interfaces
                 // or public addresses, this allows testing offline.
@@ -1988,7 +2074,7 @@ impl Actor {
                 };
                 if let Some(port) = port_if_unspecified {
                     let addr = SocketAddr::new(ip, port);
-                    let flags = find_flags(&netmon_state, ip);
+                    let flags = find_flags(Some(netmon_state), ip);
                     addrs.entry(addr).or_insert((DirectAddrType::Local, flags));
                 }
             }
@@ -1997,7 +2083,7 @@ impl Actor {
         // If a socket is bound to a specific address, add it.
         for (bound, local) in local_addrs {
             if !bound.ip().is_unspecified() {
-                let flags = find_flags(&netmon_state, local.ip());
+                let flags = find_flags(netmon_state.as_ref(), local.ip());
                 addrs.entry(local).or_insert((DirectAddrType::Local, flags));
             }
         }
@@ -2022,7 +2108,8 @@ impl Actor {
 }
 
 #[cfg(not(wasm_browser))]
-fn find_flags(state: &netmon::State, ip: IpAddr) -> Option<Ipv6AddrFlags> {
+fn find_flags(state: Option<&netmon::State>, ip: IpAddr) -> Option<Ipv6AddrFlags> {
+    let state = state?;
     if ip.is_ipv6() {
         state
             .interfaces
@@ -2223,6 +2310,7 @@ mod tests {
             hooks: Default::default(),
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
+            network_monitor: true,
             net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
@@ -2640,6 +2728,7 @@ mod tests {
             hooks: Default::default(),
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
+            network_monitor: true,
             net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),

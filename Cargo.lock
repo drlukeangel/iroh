@@ -3068,7 +3068,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.3"
-source = "git+https://github.com/drlukeangel/netwatch?rev=3b29b5338d8d5cca09867537b58fc954353ec393#3b29b5338d8d5cca09867537b58fc954353ec393"
+source = "git+https://github.com/drlukeangel/netwatch?rev=d3ee3c6f6a8350f3bbf9e25ee0b81536a97d87f9#d3ee3c6f6a8350f3bbf9e25ee0b81536a97d87f9"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3700,7 +3700,7 @@ dependencies = [
 [[package]]
 name = "portmapper"
 version = "0.19.3"
-source = "git+https://github.com/drlukeangel/netwatch?rev=3b29b5338d8d5cca09867537b58fc954353ec393#3b29b5338d8d5cca09867537b58fc954353ec393"
+source = "git+https://github.com/drlukeangel/netwatch?rev=d3ee3c6f6a8350f3bbf9e25ee0b81536a97d87f9#d3ee3c6f6a8350f3bbf9e25ee0b81536a97d87f9"
 dependencies = [
  "base64 0.22.1",
  "bytes",

@@ -147,6 +147,7 @@ pub struct Builder {
     hooks: EndpointHooksList,
     path_selector: Arc<dyn PathSelector>,
     portmapper_config: PortmapperConfig,
+    network_monitor: bool,
     net_report_config: NetReportConfig,
     crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
     configured_addrs: BTreeSet<SocketAddr>,
@@ -216,6 +217,7 @@ impl Builder {
             hooks: Default::default(),
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
+            network_monitor: true,
             net_report_config: Default::default(),
             crypto_provider: None,
             configured_addrs: Default::default(),
@@ -288,6 +290,7 @@ impl Builder {
             hooks: self.hooks,
             path_selector: self.path_selector,
             portmapper_config: self.portmapper_config,
+            network_monitor: self.network_monitor,
             net_report_config: self.net_report_config,
             static_config,
             configured_addrs: self.configured_addrs,
@@ -808,6 +811,21 @@ impl Builder {
     /// triggers firewall prompts).
     pub fn portmapper_config(mut self, config: PortmapperConfig) -> Self {
         self.portmapper_config = config;
+        self
+    }
+
+    /// Whether the endpoint watches the host's network interfaces. Defaults to `true`.
+    ///
+    /// With `false`, [`bind`](Builder::bind) constructs no network monitor and starts no
+    /// interface enumeration, awaited or in the background, and the endpoint reacts to no link
+    /// change: [`Endpoint::network_change`] does nothing. Everything the endpoint publishes about
+    /// its own addresses comes from the addresses its IP transports are bound to. A disabled
+    /// monitor needs every IP transport bound to a specific address (an unspecified address is
+    /// refused at bind, because expanding it needs the interface list), and is meant for an
+    /// endpoint with no relay, no address lookup and no portmapper: it has no default route to
+    /// learn, no NAT mapping to probe and no interface change to follow.
+    pub fn network_monitor(mut self, enabled: bool) -> Self {
+        self.network_monitor = enabled;
         self
     }
 
