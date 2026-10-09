@@ -170,6 +170,16 @@ fast-apple-datapath = ["noq/fast-apple-datapath"]
 tls-ring = ["noq/ring", "iroh-relay/tls-ring", "iroh-dns/tls-ring"]
 # Use aws-lc-rs as the crypto backend, unless `ring` is also enabled.
 tls-aws-lc-rs = ["noq/aws-lc-rs", "iroh-relay/tls-aws-lc-rs", "iroh-dns/tls-aws-lc-rs"]
+# RAFKA LOCAL DIVERGENCE (2026-10-09, Luke ruling R-I3 = A) — TEST-ONLY, NEVER ENABLE IN A PRODUCTION BUILD.
+# Adds `QuicTransportConfigBuilder::disable_nat_traversal_for_tests`, which switches QUIC NAT
+# traversal off for an endpoint (noq `max_remote_nat_traversal_addresses(0)`, the guard at
+# `endpoint/quic.rs` `max_remote_nat_traversal_addresses` that refuses values below 8 is bypassed on
+# purpose). With it no NAT-traversal round runs, so no direct path is opened behind a test's own
+# network seam and a datagram a test cuts cannot leave on a path a round has just opened. The
+# default builder, the default config and every routing decision are identical with or without the
+# feature; only a caller of the method changes behaviour. A dependent enables it from its
+# [dev-dependencies] alone.
+test-knobs = []
 # Unstable: Custom transport API (may change without notice)
 unstable-custom-transports = []
 # Unstable: API to access an endpoint's NetReport (may change without notice)

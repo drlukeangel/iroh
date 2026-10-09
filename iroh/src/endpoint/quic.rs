@@ -547,6 +547,19 @@ impl QuicTransportConfigBuilder {
         self
     }
 
+    /// TEST-ONLY: switches QUIC NAT traversal off for this endpoint.
+    ///
+    /// Available only with the `test-knobs` Cargo feature. The endpoint then neither accepts a
+    /// remote's NAT-traversal addresses nor negotiates the extension, so iroh never initiates a
+    /// holepunching round and a connection keeps exactly the paths it was dialled with. Both
+    /// ends of a connection must use it for the extension to be absent. It is not a production
+    /// setting: [`Self::max_remote_nat_traversal_addresses`] keeps refusing values below 8.
+    #[cfg(feature = "test-knobs")]
+    pub fn disable_nat_traversal_for_tests(mut self) -> Self {
+        self.0.max_remote_nat_traversal_addresses(0);
+        self
+    }
+
     /// Configures qlog capturing by setting a [`QlogFactory`].
     ///
     /// This assigns a [`QlogFactory`] that produces qlog capture configurations for
@@ -713,5 +726,34 @@ impl ServerConfigBuilder {
     pub fn set_time_source(mut self, time_source: Arc<dyn TimeSource>) -> Self {
         self.inner.time_source(time_source);
         self
+    }
+}
+
+#[cfg(all(test, feature = "test-knobs"))]
+mod test_knobs_tests {
+    use super::QuicTransportConfig;
+
+    fn nat_traversal_field(cfg: &QuicTransportConfig) -> String {
+        let dbg = format!("{:?}", cfg.to_inner_arc());
+        let at = dbg.find("max_remote_nat_traversal_addresses").expect("the field is in the Debug output");
+        dbg[at..].split(',').next().unwrap().to_string()
+    }
+
+    #[test]
+    fn default_config_has_nat_traversal_on() {
+        let field = nat_traversal_field(&QuicTransportConfig::default());
+        assert_ne!(field, "max_remote_nat_traversal_addresses: None", "{field}");
+    }
+
+    #[test]
+    fn test_knob_turns_nat_traversal_off() {
+        let cfg = QuicTransportConfig::builder().disable_nat_traversal_for_tests().build();
+        assert_eq!(nat_traversal_field(&cfg), "max_remote_nat_traversal_addresses: None");
+    }
+
+    #[test]
+    fn public_setter_still_refuses_below_the_floor() {
+        let cfg = QuicTransportConfig::builder().max_remote_nat_traversal_addresses(1).build();
+        assert_ne!(nat_traversal_field(&cfg), "max_remote_nat_traversal_addresses: None");
     }
 }
